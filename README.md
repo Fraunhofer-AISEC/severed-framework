@@ -22,22 +22,22 @@ Stop tracking of memory accesses. List of all tracked memory accesses will be wr
 * KVM_MAPPING_CHANGE <pid> <GPA1> <GPA2>
 Remap GPA1 of a VM with the given PID to the PFN of GPA2. 
 
-We https://github.com/jerome-pouiller/ioctl to call IOCTLs. 
-IOCTLs can be called with 
+We use https://github.com/jerome-pouiller/ioctl to call IOCTLs. 
+
 `sudo ioctl /dev/kvm <IOCTL-NAME>`
 
 ## Limitations
 
 * We do not support situations in which multiple VMs with multiple vcpus are running, and at least one physical core is shared among VMs. 
-* PIDs must match a running VM. Otherwise, host OS might freeze. 
+* PIDs must match a running VM. Otherwise, the host OS might freeze. 
 
 ## Linux Kernel and Patch
 
 * Download and extract Linux 4.18.13:
 
-* Enter the kernel directory and use patch to apply the patch: 
+* Enter the kernel directory and apply the patch: 
 
-`patch -p1 < name_of_patch`
+`patch -p1 < severed_patch_4.18.13.patch`
 
 * Build the kernel. We use this command: 
 

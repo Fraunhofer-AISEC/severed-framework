@@ -1,0 +1,795 @@
+diff -ruN linux-4.18.13_baseline_2/arch/x86/include/asm/kvm_page_track.h linux-4.18.13_3/arch/x86/include/asm/kvm_page_track.h
+--- linux-4.18.13_baseline_2/arch/x86/include/asm/kvm_page_track.h	2019-06-07 14:17:04.663929667 +0200
++++ linux-4.18.13_3/arch/x86/include/asm/kvm_page_track.h	2019-09-06 16:07:58.778371035 +0200
+@@ -4,6 +4,7 @@
+ 
+ enum kvm_page_track_mode {
+ 	KVM_PAGE_TRACK_WRITE,
++	KVM_PAGE_TRACK_ACCESS,
+ 	KVM_PAGE_TRACK_MAX,
+ };
+ 
+diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/mmu.c linux-4.18.13_3/arch/x86/kvm/mmu.c
+--- linux-4.18.13_baseline_2/arch/x86/kvm/mmu.c	2019-06-07 14:17:04.671929654 +0200
++++ linux-4.18.13_3/arch/x86/kvm/mmu.c	2019-09-06 16:07:58.786371036 +0200
+@@ -40,6 +40,7 @@
+ #include <linux/uaccess.h>
+ #include <linux/hash.h>
+ #include <linux/kern_levels.h>
++#include <linux/severed.h>
+ 
+ #include <asm/page.h>
+ #include <asm/pat.h>
+@@ -49,6 +50,8 @@
+ #include <asm/kvm_page_track.h>
+ #include "trace.h"
+ 
++extern spinlock_t tracking_lock;
++
+ /*
+  * When setting this variable to true it enables Two-Dimensional-Paging
+  * where the hardware walks 2 page tables:
+@@ -232,6 +235,10 @@
+  */
+ static const u64 shadow_nonpresent_or_rsvd_mask_len = 5;
+ 
++extern access_t *access_buffer_curr;
++extern access_t *access_buffer;
++extern bool access_buffer_overflow;
++
+ static void mmu_spte_set(u64 *sptep, u64 spte);
+ 
+ void kvm_mmu_set_mmio_spte_mask(u64 mmio_mask, u64 mmio_value)
+@@ -1432,7 +1439,8 @@
+  *
+  * Return true if tlb need be flushed.
+  */
+-static bool spte_write_protect(u64 *sptep, bool pt_protect)
++static bool spte_protect (u64 *sptep, bool pt_protect,
++			  enum kvm_page_track_mode mode)
+ {
+ 	u64 spte = *sptep;
+ 
+@@ -1440,26 +1448,34 @@
+ 	      !(pt_protect && spte_can_locklessly_be_made_writable(spte)))
+ 		return false;
+ 
+-	rmap_printk("rmap_write_protect: spte %p %llx\n", sptep, *sptep);
++	if (mode == KVM_PAGE_TRACK_WRITE)
++	  rmap_printk("rmap_write_protect: spte %p %llx\n", sptep, *sptep);
+ 
+ 	if (pt_protect)
+ 		spte &= ~SPTE_MMU_WRITEABLE;
+-	spte = spte & ~PT_WRITABLE_MASK;
+ 
++	if (mode == KVM_PAGE_TRACK_WRITE)
++	  spte = spte & ~PT_WRITABLE_MASK;
++
++	if (mode == KVM_PAGE_TRACK_ACCESS) {
++          //spte = spte & ~PT_PRESENT_MASK; //AMD
++
++          spte = spte & ~PT_WRITABLE_MASK; //Intel
++          spte = spte & ~1ULL; 
++        }
+ 	return mmu_spte_update(sptep, spte);
+ }
+ 
+-static bool __rmap_write_protect(struct kvm *kvm,
+-				 struct kvm_rmap_head *rmap_head,
+-				 bool pt_protect)
++static bool __rmap_protect(struct kvm *kvm,
++			   struct kvm_rmap_head *rmap_head,
++			   bool pt_protect, enum kvm_page_track_mode mode)
+ {
+ 	u64 *sptep;
+ 	struct rmap_iterator iter;
+ 	bool flush = false;
+-
+-	for_each_rmap_spte(rmap_head, &iter, sptep)
+-		flush |= spte_write_protect(sptep, pt_protect);
+-
++        //here the modes are KVM_PAGE_TRACK_WRITE and KVM_PAGE_TRACK_ACCESS
++        for_each_rmap_spte(rmap_head, &iter, sptep)
++          flush |= spte_protect(sptep, pt_protect, mode);
+ 	return flush;
+ }
+ 
+@@ -1548,8 +1564,8 @@
+ 	while (mask) {
+ 		rmap_head = __gfn_to_rmap(slot->base_gfn + gfn_offset + __ffs(mask),
+ 					  PT_PAGE_TABLE_LEVEL, slot);
+-		__rmap_write_protect(kvm, rmap_head, false);
+-
++		__rmap_protect(kvm, rmap_head, false, KVM_PAGE_TRACK_WRITE);
++                
+ 		/* clear the first set bit */
+ 		mask &= mask - 1;
+ 	}
+@@ -1618,27 +1634,26 @@
+ 	return 0;
+ }
+ 
+-bool kvm_mmu_slot_gfn_write_protect(struct kvm *kvm,
+-				    struct kvm_memory_slot *slot, u64 gfn)
++bool kvm_mmu_slot_gfn_protect (struct kvm *kvm,
++			       struct kvm_memory_slot *slot, u64 gfn,
++			       enum kvm_page_track_mode mode)
+ {
+ 	struct kvm_rmap_head *rmap_head;
+ 	int i;
+-	bool write_protected = false;
+-
+-	for (i = PT_PAGE_TABLE_LEVEL; i <= PT_MAX_HUGEPAGE_LEVEL; ++i) {
++	bool protected = false;
++        for (i = PT_PAGE_TABLE_LEVEL; i <= PT_MAX_HUGEPAGE_LEVEL; ++i) {
+ 		rmap_head = __gfn_to_rmap(gfn, i, slot);
+-		write_protected |= __rmap_write_protect(kvm, rmap_head, true);
++                protected |= __rmap_protect(kvm, rmap_head, true, mode);
+ 	}
+-
+-	return write_protected;
+-}
++	return protected;
++  }
+ 
+ static bool rmap_write_protect(struct kvm_vcpu *vcpu, u64 gfn)
+ {
+ 	struct kvm_memory_slot *slot;
+ 
+ 	slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
+-	return kvm_mmu_slot_gfn_write_protect(vcpu->kvm, slot, gfn);
++        return kvm_mmu_slot_gfn_protect (vcpu->kvm, slot, gfn, KVM_PAGE_TRACK_WRITE);
+ }
+ 
+ static bool kvm_zap_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head)
+@@ -2999,7 +3014,7 @@
+ 	__direct_pte_prefetch(vcpu, sp, sptep);
+ }
+ 
+-static int __direct_map(struct kvm_vcpu *vcpu, int write, int map_writable,
++int __direct_map(struct kvm_vcpu *vcpu, int write, int map_writable,
+ 			int level, gfn_t gfn, kvm_pfn_t pfn, bool prefault)
+ {
+ 	struct kvm_shadow_walk_iterator iterator;
+@@ -3753,12 +3768,47 @@
+ static bool page_fault_handle_page_track(struct kvm_vcpu *vcpu,
+ 					 u32 error_code, gfn_t gfn)
+ {
++	struct kvm_memory_slot *slot;
++	int idx;
++
+ 	if (unlikely(error_code & PFERR_RSVD_MASK))
+ 		return false;
+ 
+ 	if (!(error_code & PFERR_PRESENT_MASK) ||
+-	      !(error_code & PFERR_WRITE_MASK))
++	      !(error_code & PFERR_WRITE_MASK)) {
++
++		if (kvm_page_track_is_active(vcpu, gfn, KVM_PAGE_TRACK_ACCESS) && !(error_code & PFERR_PRESENT_MASK)) {
++			idx = srcu_read_lock(&vcpu->kvm->srcu);
++			slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
++			if ( slot != NULL ) {
++                                spin_lock(&vcpu->kvm->mmu_lock);
++				kvm_slot_page_track_remove_page(vcpu->kvm, slot, gfn, KVM_PAGE_TRACK_ACCESS);
++                                spin_unlock(&vcpu->kvm->mmu_lock);
++                                srcu_read_unlock(&vcpu->kvm->srcu, idx);
++
++                                spin_lock(&tracking_lock);
++                                //store page access
++                                access_buffer_curr->time = ktime_get();
++                                access_buffer_curr->gfn = gfn;
++                                access_buffer_curr->error_code = error_code;
++                                //check for overflow and increment pointer
++                                if (unlikely(access_buffer_curr >= (access_buffer + MAX_SEV_BUF_SIZE - 1))){
++                                    printk("SEVered: Attention, ring buffer overflow!\n");
++                                    access_buffer_overflow = true;
++                                    access_buffer_curr = access_buffer;
++                                }
++                                else
++                                    access_buffer_curr += 1;
++                                spin_unlock(&tracking_lock);
++			} else {
++				srcu_read_unlock(&vcpu->kvm->srcu, idx);
++				//should not happen
++				printk("SEVered: Attention, No memory slot found for gfn 0x%016llx\n", gfn);
++			}
++		}
++
+ 		return false;
++	}
+ 
+ 	/*
+ 	 * guest is writing the page which is write tracked which can
+@@ -5226,7 +5276,7 @@
+ static bool slot_rmap_write_protect(struct kvm *kvm,
+ 				    struct kvm_rmap_head *rmap_head)
+ {
+-	return __rmap_write_protect(kvm, rmap_head, false);
++	return __rmap_protect(kvm, rmap_head, false, KVM_PAGE_TRACK_WRITE);
+ }
+ 
+ void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
+diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/mmu.h linux-4.18.13_3/arch/x86/kvm/mmu.h
+--- linux-4.18.13_baseline_2/arch/x86/kvm/mmu.h	2019-06-07 14:17:04.671929654 +0200
++++ linux-4.18.13_3/arch/x86/kvm/mmu.h	2019-09-06 16:07:58.786371036 +0200
+@@ -191,7 +191,8 @@
+ 
+ void kvm_mmu_gfn_disallow_lpage(struct kvm_memory_slot *slot, gfn_t gfn);
+ void kvm_mmu_gfn_allow_lpage(struct kvm_memory_slot *slot, gfn_t gfn);
+-bool kvm_mmu_slot_gfn_write_protect(struct kvm *kvm,
+-				    struct kvm_memory_slot *slot, u64 gfn);
++bool kvm_mmu_slot_gfn_protect (struct kvm *kvm,
++			       struct kvm_memory_slot *slot, u64 gfn,
++			       enum kvm_page_track_mode mode);
+ int kvm_arch_write_log_dirty(struct kvm_vcpu *vcpu);
+ #endif
+diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/page_track.c linux-4.18.13_3/arch/x86/kvm/page_track.c
+--- linux-4.18.13_baseline_2/arch/x86/kvm/page_track.c	2019-06-07 14:17:04.671929654 +0200
++++ linux-4.18.13_3/arch/x86/kvm/page_track.c	2019-09-06 16:07:58.786371036 +0200
+@@ -105,9 +105,9 @@
+ 	 */
+ 	kvm_mmu_gfn_disallow_lpage(slot, gfn);
+ 
+-	if (mode == KVM_PAGE_TRACK_WRITE)
+-		if (kvm_mmu_slot_gfn_write_protect(kvm, slot, gfn))
+-			kvm_flush_remote_tlbs(kvm);
++        //here the modes are KVM_PAGE_TRACK_WRITE or KVM_PAGE_TRACK_ACCESS
++        if (kvm_mmu_slot_gfn_protect(kvm, slot, gfn, mode))
++          kvm_flush_remote_tlbs(kvm);
+ }
+ EXPORT_SYMBOL_GPL(kvm_slot_page_track_add_page);
+ 
+diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/svm.c linux-4.18.13_3/arch/x86/kvm/svm.c
+--- linux-4.18.13_baseline_2/arch/x86/kvm/svm.c	2019-06-07 14:17:04.671929654 +0200
++++ linux-4.18.13_3/arch/x86/kvm/svm.c	2019-09-06 16:07:58.786371036 +0200
+@@ -54,6 +54,8 @@
+ #include <asm/virtext.h>
+ #include "trace.h"
+ 
++#include <linux/severed.h>
++
+ #define __ex(x) __kvm_handle_fault_on_reboot(x)
+ 
+ MODULE_AUTHOR("Qumranet");
+@@ -131,6 +133,9 @@
+ 
+ #define NR_HOST_SAVE_USER_MSRS ARRAY_SIZE(host_save_user_msrs)
+ 
++extern int severed_action;
++extern spinlock_t severed_action_lock;
++
+ struct kvm_sev_info {
+ 	bool active;		/* SEV enabled guest */
+ 	unsigned int asid;	/* ASID used for this guest */
+@@ -4898,6 +4903,32 @@
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+ 	struct kvm_run *kvm_run = vcpu->run;
+ 	u32 exit_code = svm->vmcb->control.exit_code;
++        long severed_retval;
++
++        spin_lock(&severed_action_lock);
++        switch (severed_action) {
++		case SEVERED_NONE:
++			break;
++		case SEVERED_STARTTR:
++		   printk (KERN_DEBUG "SEVered: I am here in svm.c handle_exit case SEVERED_STARTTR\n");
++			severed_retval = kvm_start_tracking(vcpu);
++			break;
++		case SEVERED_STOPTR:
++			severed_retval = kvm_stop_tracking(vcpu);
++			break;
++		case SEVERED_CHGMP:
++			severed_retval = kvm_change_mapping(vcpu);
++			if ( severed_retval == 1 ) {
++				svm_flush_tlb(vcpu, true);
++				//Success message required to inform userspace tools about suceeded remapping
++				//TODO: Cleaner implementation replaces this feedback with an appropriate feedback mechanism 
++				//(e.g., via ioctl)
++				printk("SEVered: in %s, found valid mapping for gfn\n", __func__);
++			}
++			break;
++        }
++        severed_action = SEVERED_NONE;
++        spin_unlock(&severed_action_lock);
+ 
+ 	trace_kvm_exit(exit_code, vcpu, KVM_ISA_SVM);
+ 
+diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/vmx.c linux-4.18.13_3/arch/x86/kvm/vmx.c
+--- linux-4.18.13_baseline_2/arch/x86/kvm/vmx.c	2019-06-07 14:17:04.671929654 +0200
++++ linux-4.18.13_3/arch/x86/kvm/vmx.c	2019-09-06 16:07:58.786371036 +0200
+@@ -54,6 +54,12 @@
+ #include <asm/spec-ctrl.h>
+ #include <asm/mshyperv.h>
+ 
++
++#include <linux/severed.h>
++extern int severed_action;
++extern int severed_pid_from_shell;
++extern spinlock_t severed_action_lock;
++
+ #include "trace.h"
+ #include "pmu.h"
+ #include "vmx_evmcs.h"
+@@ -9640,6 +9646,44 @@
+ 	u32 exit_reason = vmx->exit_reason;
+ 	u32 vectoring_info = vmx->idt_vectoring_info;
+ 
++        pid_t  severed_vm_pid = vcpu -> kvm -> userspace_pid;
++        long severed_retval;
++
++        //i j to print out memslots
++        //int i,j;
++
++        spin_lock(&severed_action_lock);
++        switch (severed_action) {
++	case SEVERED_NONE:
++	  break;
++	case SEVERED_STARTTR:
++          //if the process id (pid) of the vm coincides with the pid given from the shell then start tracking
++          if (severed_vm_pid == severed_pid_from_shell) {
++            severed_retval = kvm_start_tracking(vcpu);
++            severed_action = SEVERED_NONE;
++          }
++          break;
++	case SEVERED_STOPTR:
++          if (severed_vm_pid == severed_pid_from_shell) {
++            severed_retval = kvm_stop_tracking(vcpu);
++            severed_action = SEVERED_NONE;
++          }
++	  break;
++        case SEVERED_CHGMP:
++          if (severed_vm_pid == severed_pid_from_shell) {
++            severed_retval = kvm_change_mapping(vcpu);
++            if ( severed_retval == 1 ) {
++              vmx_flush_tlb(vcpu, true);
++              //Success message required to inform userspace tools about suceeded remapping
++              //TODO: Cleaner implementation replaces this feedback with an appropriate feedback mechanism 
++              //(e.g., via ioctl)
++              printk("SEVered: in %s, found valid mapping for gfn for the vm with the pid %d\n", __func__, severed_vm_pid);
++            }
++            severed_action = SEVERED_NONE;
++          }
++	  break;
++        }
++        spin_unlock(&severed_action_lock);
+ 	trace_kvm_exit(exit_reason, vcpu, KVM_ISA_VMX);
+ 
+ 	/*
+diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/x86.c linux-4.18.13_3/arch/x86/kvm/x86.c
+--- linux-4.18.13_baseline_2/arch/x86/kvm/x86.c	2019-06-07 14:17:04.671929654 +0200
++++ linux-4.18.13_3/arch/x86/kvm/x86.c	2019-09-06 16:07:58.786371036 +0200
+@@ -69,6 +69,7 @@
+ #include <asm/irq_remapping.h>
+ #include <asm/mshyperv.h>
+ #include <asm/hypervisor.h>
++#include <linux/severed.h>
+ 
+ #define CREATE_TRACE_POINTS
+ #include "trace.h"
+@@ -98,6 +99,13 @@
+ #define KVM_X2APIC_API_VALID_FLAGS (KVM_X2APIC_API_USE_32BIT_IDS | \
+                                     KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK)
+ 
++DEFINE_SPINLOCK(tracking_lock);
++extern mapping_change_param_t severed_change_param;
++extern ktime_t severed_stop_time;
++access_t *access_buffer_curr;
++access_t *access_buffer = NULL;
++bool access_buffer_overflow = false;
++
+ static void update_cr8_intercept(struct kvm_vcpu *vcpu);
+ static void process_nmi(struct kvm_vcpu *vcpu);
+ static void enter_smm(struct kvm_vcpu *vcpu);
+@@ -2979,6 +2987,172 @@
+ 
+ }
+ 
++long kvm_start_tracking(struct kvm_vcpu *vcpu)
++{
++        long count = 0;
++        u64 iterator, iterat_max;
++        struct kvm_memory_slot *slot;
++        int idx;
++
++        spin_lock(&tracking_lock);
++        if (access_buffer == NULL){
++                access_buffer = kmalloc(sizeof(access_t)*MAX_SEV_BUF_SIZE, GFP_KERNEL);
++                if (!access_buffer) {
++			//This should not happen
++			printk("SEVered: Allocation of tracking buffer failed. Exiting!");
++			return -1;
++                }
++        }
++        access_buffer_overflow = false;
++        access_buffer_curr = access_buffer;
++        spin_unlock(&tracking_lock);
++        iterat_max = vcpu->kvm->memslots[0]->memslots[0].base_gfn + vcpu->kvm->memslots[0]->memslots[0].npages;
++        for (iterator=0; iterator < iterat_max; iterator++)
++        {
++                idx = srcu_read_lock(&vcpu->kvm->srcu);
++                slot = kvm_vcpu_gfn_to_memslot(vcpu, iterator);
++                if ( slot != NULL  && !kvm_page_track_is_active(vcpu, iterator, KVM_PAGE_TRACK_ACCESS)) {
++                        spin_lock(&vcpu->kvm->mmu_lock);
++                        kvm_slot_page_track_add_page(vcpu->kvm, slot, iterator, KVM_PAGE_TRACK_ACCESS);
++                        spin_unlock(&vcpu->kvm->mmu_lock);
++                        count++;
++                }
++                srcu_read_unlock(&vcpu->kvm->srcu, idx);
++        }
++        
++        return count;
++}
++EXPORT_SYMBOL(kvm_start_tracking);
++
++long kvm_stop_tracking(struct kvm_vcpu *vcpu)
++{
++        long count = 0;
++        access_t *pos;
++        int comma_separator = 1000000000;
++        u64 iterator, iterat_max;
++        struct kvm_memory_slot *slot;
++        int idx;
++        pid_t severed_vm_pid = vcpu -> kvm -> userspace_pid; 
++
++        iterat_max = vcpu->kvm->memslots[0]->memslots[0].base_gfn + vcpu->kvm->memslots[0]->memslots[0].npages;
++        for (iterator=0; iterator < iterat_max; iterator++)
++        {
++        	idx = srcu_read_lock(&vcpu->kvm->srcu);
++		slot = kvm_vcpu_gfn_to_memslot(vcpu, iterator);
++			if ( slot != NULL  && kvm_page_track_is_active(vcpu, iterator, KVM_PAGE_TRACK_ACCESS)) {
++				spin_lock(&vcpu->kvm->mmu_lock);
++				kvm_slot_page_track_remove_page(vcpu->kvm, slot, iterator, KVM_PAGE_TRACK_ACCESS);
++				spin_unlock(&vcpu->kvm->mmu_lock);
++				count++;
++            	}
++		srcu_read_unlock(&vcpu->kvm->srcu, idx);
++        }
++
++        if (access_buffer == NULL) {
++            printk("SEVered: Tracking has not been started yet, stopping.\n");
++            return -2;
++        }
++
++	//Print the time when tracking was stopped. 
++	//Required to calculate time offset of memory accesses in evaluation
++        printk("SEVered:basetime:%lld.%09lld\n", severed_stop_time/comma_separator, severed_stop_time%comma_separator); 
++
++	//Print all tracked pages in the ring buffer
++        spin_lock(&tracking_lock);
++
++	//If ring buffer is full, start with the last tracked page
++        if (access_buffer_overflow) {
++            pos = access_buffer_curr;
++            while (pos < access_buffer + MAX_SEV_BUF_SIZE){
++                if (pos->time <= severed_stop_time)
++                  printk("SEVered:%d:%06llx:%02x:%lld.%09lld\n", severed_vm_pid, pos->gfn, pos->error_code, pos->time/comma_separator, pos->time%comma_separator);
++                pos->gfn = 0;
++                pos->error_code = 0;
++                pos->time = 0;
++                pos++;
++            }
++        }
++
++        pos = access_buffer;
++
++	//Print the content of the ring buffer
++        while (pos < access_buffer_curr){
++            if (pos->time <= severed_stop_time)
++              printk("SEVered:%d:%06llx:%02x:%lld.%09lld\n", severed_vm_pid, pos->gfn, pos->error_code, pos->time/comma_separator, pos->time%comma_separator);
++            pos->gfn = 0;
++            pos->error_code = 0;
++            pos->time = 0;
++            pos++;
++        }
++
++        access_buffer_curr = access_buffer;
++        spin_unlock(&tracking_lock);
++
++        return count;
++}
++EXPORT_SYMBOL(kvm_stop_tracking);
++
++long kvm_change_mapping(struct kvm_vcpu *vcpu)
++{
++        char s_gfn1[9];
++        char s_gfn2[9];
++        __u64 gfn1;
++        __u64 gfn2;
++        int ret;
++        kvm_pfn_t pfn2;
++        int level = 1;
++
++        memset(s_gfn1, 0, sizeof(s_gfn1));
++        memset(s_gfn2, 0, sizeof(s_gfn2));
++
++        memcpy(s_gfn1, severed_change_param.gfn1, 8);
++        memcpy(s_gfn2, severed_change_param.gfn2, 8);
++
++        ret = kstrtou64(s_gfn1, 16, &gfn1);
++        if (ret < 0 ) {
++                printk("SEVered: Something went from within kstrtou64 with s_gfn1: %s. ret: %d\n", s_gfn1, ret);
++                return -2;
++        }
++        
++        ret = kstrtou64(s_gfn2, 16, &gfn2);
++        if (ret < 0 ) {
++                printk("SEVered: Something went from within kstrtou64 with s_gfn2: %s. ret: %d\n", s_gfn2, ret);
++                return -3;
++        }
++
++        pfn2 = gfn_to_pfn(vcpu->kvm, gfn2);
++
++        //error codes, see kvm_host.h
++        if ((pfn2 & KVM_PFN_ERR_MASK) || (pfn2 & KVM_PFN_ERR_NOSLOT_MASK)) {
++          printk("SEVered: gfn_to_pfn returned an invalid return value: 0x%016llx\n", pfn2);
++          return -4;
++        }
++        
++        if (pfn2 > MAX_HOST_MEMORY) {
++          printk("SEVered: pfn out of memory bound. pfn2: 0x%016llx\n", pfn2);
++          return -5;
++        }
++        
++        if (gfn1 != 0 && gfn2 != 0 && !(pfn2 & KVM_PFN_NOSLOT))
++        {
++                spin_lock(&vcpu->kvm->mmu_lock);
++                
++                ret = __direct_map(vcpu, 0, 1, level, gfn1, pfn2, 0);
++                        
++                spin_unlock(&vcpu->kvm->mmu_lock);
++
++		//TLB needs to be flushed, calling function is responsible
++                return 1;
++        } else {
++		//Inform user space that remapping failed
++		//See TODO in svm.c
++                printk("SEVered: in %s, no valid mapping found for gfn 0x%016llx (pfn: 0x%016llx)\n", __func__, gfn2, pfn2);
++	}
++
++        return 0;
++}
++EXPORT_SYMBOL(kvm_change_mapping);
++
+ long kvm_arch_dev_ioctl(struct file *filp,
+ 			unsigned int ioctl, unsigned long arg)
+ {
+@@ -7428,7 +7602,7 @@
+ 		}
+ 	}
+ 
+-	r = kvm_mmu_reload(vcpu);
++        r = kvm_mmu_reload(vcpu);
+ 	if (unlikely(r)) {
+ 		goto cancel_injection;
+ 	}
+@@ -7699,7 +7873,7 @@
+  *   for each fragment
+  *     for each mmio piece in the fragment
+  *       write gpa, len
+- *       copy data
++*       copy data
+  *       exit
+  */
+ static int complete_emulated_mmio(struct kvm_vcpu *vcpu)
+diff -ruN linux-4.18.13_baseline_2/include/linux/kvm_host.h linux-4.18.13_3/include/linux/kvm_host.h
+--- linux-4.18.13_baseline_2/include/linux/kvm_host.h	2019-06-07 14:17:05.859927677 +0200
++++ linux-4.18.13_3/include/linux/kvm_host.h	2019-09-06 16:07:59.410371117 +0200
+@@ -584,7 +584,6 @@
+ static inline struct kvm_memslots *kvm_vcpu_memslots(struct kvm_vcpu *vcpu)
+ {
+ 	int as_id = kvm_arch_vcpu_memslots_id(vcpu);
+-
+ 	return __kvm_memslots(vcpu->kvm, as_id);
+ }
+ 
+@@ -1288,3 +1287,6 @@
+ #endif /* CONFIG_HAVE_KVM_VCPU_RUN_PID_CHANGE */
+ 
+ #endif
++
++int __direct_map(struct kvm_vcpu *vcpu, int write, int map_writable,
++                        int level, gfn_t gfn, kvm_pfn_t pfn, bool prefault); 
+diff -ruN linux-4.18.13_baseline_2/include/linux/severed.h linux-4.18.13_3/include/linux/severed.h
+--- linux-4.18.13_baseline_2/include/linux/severed.h	1970-01-01 01:00:00.000000000 +0100
++++ linux-4.18.13_3/include/linux/severed.h	2019-09-06 16:07:59.410371117 +0200
+@@ -0,0 +1,22 @@
++#ifndef __SEVERED_H
++#define __SEVERED_H
++
++typedef struct access {
++    __u64 gfn;
++    u32 error_code;
++    ktime_t time;
++} access_t;
++
++#define MAX_SEV_BUF_SIZE 150000
++//Used to check if a pfn is out of bounds
++#define MAX_HOST_MEMORY 0xFFFFFF
++
++#define SEVERED_NONE 0
++#define SEVERED_STARTTR 1
++#define SEVERED_STOPTR 2
++#define SEVERED_CHGMP 3
++
++long kvm_start_tracking(struct kvm_vcpu *vcpu);
++long kvm_stop_tracking(struct kvm_vcpu *vcpu);
++long kvm_change_mapping(struct kvm_vcpu *vcpu);
++#endif
+diff -ruN linux-4.18.13_baseline_2/include/uapi/linux/kvm.h linux-4.18.13_3/include/uapi/linux/kvm.h
+--- linux-4.18.13_baseline_2/include/uapi/linux/kvm.h	2019-06-07 14:17:05.915927583 +0200
++++ linux-4.18.13_3/include/uapi/linux/kvm.h	2019-09-06 16:07:59.454371123 +0200
+@@ -60,6 +60,22 @@
+ 	__u32 buf_nr;
+ };
+ 
++// pid of a vm from the shell will be written in the string str_pid
++// in kvm_main.c and then converted into a number (pid_t type)
++// for the case KVM_MAPPING_CHANGE
++typedef struct mapping_change_param {
++    char gfn1[8];
++    char gfn2[8];
++    char str_pid[16];
++     
++} mapping_change_param_t;
++
++//for the cases KVM_TRACKING_ENABLE and KVM_TRACKING_DISABLE
++typedef struct str_pid_param {
++    char str_pid[16];
++} str_pid_param_t;
++
++
+ #define __KVM_DEPRECATED_MAIN_W_0x06 \
+ 	_IOW(KVMIO, 0x06, struct kvm_user_trace_setup)
+ #define __KVM_DEPRECATED_MAIN_0x07 _IO(KVMIO, 0x07)
+@@ -774,6 +790,10 @@
+ #define KVM_GET_EMULATED_CPUID	  _IOWR(KVMIO, 0x09, struct kvm_cpuid2)
+ #define KVM_GET_MSR_FEATURE_INDEX_LIST    _IOWR(KVMIO, 0x0a, struct kvm_msr_list)
+ 
++#define KVM_TRACKING_ENABLE       _IOWR(KVMIO, 0x0b, str_pid_param_t)
++#define KVM_TRACKING_DISABLE      _IOWR(KVMIO, 0x0c, str_pid_param_t)
++#define KVM_MAPPING_CHANGE        _IOWR(KVMIO, 0x0d, mapping_change_param_t)
++
+ /*
+  * Extension capability list.
+  */
+diff -ruN linux-4.18.13_baseline_2/virt/kvm/kvm_main.c linux-4.18.13_3/virt/kvm/kvm_main.c
+--- linux-4.18.13_baseline_2/virt/kvm/kvm_main.c	2019-06-07 14:17:05.831927722 +0200
++++ linux-4.18.13_3/virt/kvm/kvm_main.c	2019-09-06 16:07:59.586371140 +0200
+@@ -62,6 +62,8 @@
+ #include "async_pf.h"
+ #include "vfio.h"
+ 
++#include <linux/severed.h>
++
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/kvm.h>
+ 
+@@ -96,6 +98,18 @@
+ static DEFINE_RAW_SPINLOCK(kvm_count_lock);
+ LIST_HEAD(vm_list);
+ 
++int severed_action = SEVERED_NONE;
++pid_t severed_pid_from_shell;
++EXPORT_SYMBOL(severed_action);
++EXPORT_SYMBOL(severed_pid_from_shell);
++
++mapping_change_param_t severed_change_param;
++str_pid_param_t severed_strpid_param;
++ktime_t severed_stop_time;
++EXPORT_SYMBOL(severed_stop_time);
++DEFINE_SPINLOCK(severed_action_lock);
++EXPORT_SYMBOL(severed_action_lock);
++
+ static cpumask_var_t cpus_hardware_enabled;
+ static int kvm_usage_count;
+ static atomic_t hardware_enable_failed;
+@@ -3220,6 +3234,13 @@
+ 			  unsigned int ioctl, unsigned long arg)
+ {
+ 	long r = -EINVAL;
++        void __user *argp;
++
++        char line[32];
++        char *p; // a pointer to the line for using strsep() function since it takes (char**)
++        char *c; // a pointer which will point to an element after the comma sign
++        long long_num_for_pid;
++        int ret, n;
+ 
+ 	switch (ioctl) {
+ 	case KVM_GET_API_VERSION:
+@@ -3249,6 +3270,95 @@
+ 	case KVM_TRACE_DISABLE:
+ 		r = -EOPNOTSUPP;
+ 		break;
++                
++        case KVM_TRACKING_ENABLE:
++          argp = (void __user *) arg;
++          spin_lock(&severed_action_lock);
++          if (severed_action == SEVERED_NONE) {
++            if (copy_from_user (severed_strpid_param.str_pid, argp, sizeof(severed_strpid_param)))
++              return -EFAULT;
++            n = strlen (severed_strpid_param.str_pid);
++            ret = kstrtol (severed_strpid_param.str_pid, 10, &long_num_for_pid);
++            if (ret) {
++              printk("SEVered: invalid pid for KVM_TRACKING_ENABLE\n");
++              severed_action = SEVERED_NONE;
++            }
++            else {
++              severed_pid_from_shell = (pid_t)long_num_for_pid;
++              severed_action = SEVERED_STARTTR;
++            }
++            r = 0;
++          }                
++          spin_unlock(&severed_action_lock);
++          break;
++          
++        case KVM_TRACKING_DISABLE:
++                severed_stop_time = ktime_get();
++                argp = (void __user *) arg;
++                spin_lock(&severed_action_lock);
++                if (severed_action == SEVERED_NONE) {
++                  if (copy_from_user (severed_strpid_param.str_pid, argp, sizeof(severed_strpid_param)))
++                    return -EFAULT;
++                  ret = kstrtol (severed_strpid_param.str_pid, 10, &long_num_for_pid);
++                  if (ret) {
++                    printk ("SEVered: invalid pid for KVM_TRACKING_DISABLE\n");
++                    severed_action = SEVERED_NONE;
++                  }
++                  else {
++                    severed_pid_from_shell = (pid_t)long_num_for_pid;
++                    severed_action = SEVERED_STOPTR;
++                  }
++                  r = 0;
++                }
++                spin_unlock(&severed_action_lock);
++                break;
++                
++        case KVM_MAPPING_CHANGE:
++          argp = (void __user *)arg;
++          spin_lock(&severed_action_lock);
++          if (severed_action == SEVERED_NONE) {
++            if (copy_from_user(&line, argp, sizeof(line)))
++              return -EFAULT;
++            p = line;
++            c = strsep(&p, ",");
++            if (!c) {
++              printk ("SEVered: something wrong with the input for the case KVM_MAPPING_CHANGE, example: 4537,000023a5,0000f365  where pid,gfn1,gfn2\n");
++              r = 0;
++              spin_unlock(&severed_action_lock);
++              break;
++            }
++            n = strlen(c);
++            memcpy (severed_change_param.str_pid, c, n);
++            severed_change_param.str_pid[n] = '\0';
++            ret = kstrtol (severed_change_param.str_pid, 10, &long_num_for_pid);
++            if (ret) {
++              printk("SEVered: invalid pid for KVM_MAPPING_CHANGE \n");
++              r = 0;
++              spin_unlock(&severed_action_lock);
++              break;
++            }
++            severed_pid_from_shell = (pid_t)long_num_for_pid;
++            c = strsep(&p, ",");
++            if (!c) {
++              printk ("SEVered: something wrong with the input for the case KVM_MAPPING_CHANGE, example: 4537,000023a5,0000f365  where pid,gfn1,gfn2\n");
++              r = 0;
++              spin_unlock(&severed_action_lock);
++              break;
++            }
++            memcpy(severed_change_param.gfn1, c, 8);
++            c = strsep(&p, ",");
++            if (!c) {
++              printk ("SEVered: something wrong with the input for the case KVM_MAPPING_CHANGE, example: 4537,000023a5,0000f365  where pid,gfn1,gfn2\n");
++              r = 0;
++              spin_unlock(&severed_action_lock);
++              break;
++            }
++            memcpy(severed_change_param.gfn2, c, 8);
++            severed_action = SEVERED_CHGMP;
++            r = 0;
++          }
++          spin_unlock(&severed_action_lock);
++          break;
+ 	default:
+ 		return kvm_arch_dev_ioctl(filp, ioctl, arg);
+ 	}
