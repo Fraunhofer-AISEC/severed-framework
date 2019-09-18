@@ -19,8 +19,8 @@ Start to track memory accesses of a VM with the given PID. Each memory access wi
 * KVM_TRACKING_DISABLE <pid>
 Stop tracking of memory accesses. List of all tracked memory accesses will be written to dmesg. 
 
-* KVM_MAPPING_CHANGE <pid> <GPA1> <GPA2>
-Remap GPA1 of a VM with the given PID to the PFN of GPA2. 
+* KVM_MAPPING_CHANGE <pid> <GFN1> <GFN2>
+Remap GFN1 of a VM with the given PID to the PFN of GFN2. 
 
 We use https://github.com/jerome-pouiller/ioctl to call IOCTLs. 
 
@@ -49,6 +49,8 @@ We use https://github.com/jerome-pouiller/ioctl to call IOCTLs.
 
 ## Ioctl Tool Installation
 
+Note: Ioctl installation can be a bit difficult. Alternatively, you may want to write you own programm to send data to /dev/kvm. 
+
 In order to install the ioctl tool the following steps are taken:
 
 * download the ioctl tool here https://github.com/jerome-pouiller/ioctl,
@@ -76,12 +78,10 @@ with  the line
 
 * hit "make" again,
 
-* if a compiler complains about the variables `KMV_TRACKING_ENABLE`,
-`KVM_TRACKING_DISABLE` and `KVM_MAPPING_CHANGE` then
-copy the file kvm.h from your patched linux directory to the installed 
+* copy the file kvm.h from your patched linux directory to the installed 
 linux directory. (important: linux kernel should be built at this step):
 
-`sudo cp your_linux_folder/usr/include/linux/kvm.h /usr/include/linux`
+`sudo cp your_linux_folder/include/uapi/linux/kvm.h /usr/include/linux/`
 
 * hit "sudo make install".
 
@@ -98,15 +98,19 @@ See below how to run the tool.
 
 * To start tracking use the command:
 
-`sudo ioctl /dev/kvm KVM_TRACKING_ENABLE <PID>`.
+`sudo ioctl /dev/kvm KVM_TRACKING_ENABLE 
+
+Afterwards, enter the PID of the VM you want to be tracked.`
 
 * To stop tracking use the command
 
 `sudo ioctl /dev/kvm KVM_TRACKING_DISABLE <PID>`.
 
+Afterwards, enter the PID of the VM.
+
 * To change mapping use the command
 
 `sudo ioctl /dev/kvm KVM_MAPPING_CHANGE`.
 
-Here it is required to give a PID, GPA1 and GPA2 separated by comma, for instance, 3132,00002a96,000036f1.
+Here it is required to give a PID, GFN1 and GFN2 separated by comma, for instance, 3132,2a96,36f1.
 
