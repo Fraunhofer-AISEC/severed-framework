@@ -1,6 +1,6 @@
-diff -ruN linux-4.18.13_baseline_2/arch/x86/include/asm/kvm_page_track.h linux-4.18.13_3/arch/x86/include/asm/kvm_page_track.h
---- linux-4.18.13_baseline_2/arch/x86/include/asm/kvm_page_track.h	2019-06-07 14:17:04.663929667 +0200
-+++ linux-4.18.13_3/arch/x86/include/asm/kvm_page_track.h	2019-09-06 16:07:58.778371035 +0200
+diff -ruN linux-4.18.13.orig/arch/x86/include/asm/kvm_page_track.h linux-4.18.13.patched/arch/x86/include/asm/kvm_page_track.h
+--- linux-4.18.13.orig/arch/x86/include/asm/kvm_page_track.h	2018-10-10 08:56:08.000000000 +0200
++++ linux-4.18.13.patched/arch/x86/include/asm/kvm_page_track.h	2019-09-18 11:05:35.272805610 +0200
 @@ -4,6 +4,7 @@
  
  enum kvm_page_track_mode {
@@ -9,9 +9,9 @@ diff -ruN linux-4.18.13_baseline_2/arch/x86/include/asm/kvm_page_track.h linux-4
  	KVM_PAGE_TRACK_MAX,
  };
  
-diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/mmu.c linux-4.18.13_3/arch/x86/kvm/mmu.c
---- linux-4.18.13_baseline_2/arch/x86/kvm/mmu.c	2019-06-07 14:17:04.671929654 +0200
-+++ linux-4.18.13_3/arch/x86/kvm/mmu.c	2019-09-06 16:07:58.786371036 +0200
+diff -ruN linux-4.18.13.orig/arch/x86/kvm/mmu.c linux-4.18.13.patched/arch/x86/kvm/mmu.c
+--- linux-4.18.13.orig/arch/x86/kvm/mmu.c	2018-10-10 08:56:08.000000000 +0200
++++ linux-4.18.13.patched/arch/x86/kvm/mmu.c	2019-09-18 11:47:28.370560316 +0200
 @@ -40,6 +40,7 @@
  #include <linux/uaccess.h>
  #include <linux/hash.h>
@@ -50,27 +50,24 @@ diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/mmu.c linux-4.18.13_3/arch/x86/k
  {
  	u64 spte = *sptep;
  
-@@ -1440,26 +1448,34 @@
+@@ -1440,25 +1448,32 @@
  	      !(pt_protect && spte_can_locklessly_be_made_writable(spte)))
  		return false;
  
 -	rmap_printk("rmap_write_protect: spte %p %llx\n", sptep, *sptep);
 +	if (mode == KVM_PAGE_TRACK_WRITE)
-+	  rmap_printk("rmap_write_protect: spte %p %llx\n", sptep, *sptep);
++	  	rmap_printk("rmap_write_protect: spte %p %llx\n", sptep, *sptep);
  
  	if (pt_protect)
  		spte &= ~SPTE_MMU_WRITEABLE;
 -	spte = spte & ~PT_WRITABLE_MASK;
  
 +	if (mode == KVM_PAGE_TRACK_WRITE)
-+	  spte = spte & ~PT_WRITABLE_MASK;
++		spte = spte & ~PT_WRITABLE_MASK;
 +
-+	if (mode == KVM_PAGE_TRACK_ACCESS) {
-+          //spte = spte & ~PT_PRESENT_MASK; //AMD
-+
-+          spte = spte & ~PT_WRITABLE_MASK; //Intel
-+          spte = spte & ~1ULL; 
-+        }
++	if (mode == KVM_PAGE_TRACK_ACCESS) 
++        	spte = spte & ~PT_PRESENT_MASK; 
++	
  	return mmu_spte_update(sptep, spte);
  }
  
@@ -84,28 +81,24 @@ diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/mmu.c linux-4.18.13_3/arch/x86/k
  	u64 *sptep;
  	struct rmap_iterator iter;
  	bool flush = false;
--
--	for_each_rmap_spte(rmap_head, &iter, sptep)
+ 
++	//here the modes are KVM_PAGE_TRACK_WRITE and KVM_PAGE_TRACK_ACCESS
+ 	for_each_rmap_spte(rmap_head, &iter, sptep)
 -		flush |= spte_write_protect(sptep, pt_protect);
--
-+        //here the modes are KVM_PAGE_TRACK_WRITE and KVM_PAGE_TRACK_ACCESS
-+        for_each_rmap_spte(rmap_head, &iter, sptep)
-+          flush |= spte_protect(sptep, pt_protect, mode);
++        	flush |= spte_protect(sptep, pt_protect, mode);
+ 
  	return flush;
  }
- 
-@@ -1548,8 +1564,8 @@
+@@ -1548,7 +1563,7 @@
  	while (mask) {
  		rmap_head = __gfn_to_rmap(slot->base_gfn + gfn_offset + __ffs(mask),
  					  PT_PAGE_TABLE_LEVEL, slot);
 -		__rmap_write_protect(kvm, rmap_head, false);
--
 +		__rmap_protect(kvm, rmap_head, false, KVM_PAGE_TRACK_WRITE);
-+                
+ 
  		/* clear the first set bit */
  		mask &= mask - 1;
- 	}
-@@ -1618,27 +1634,26 @@
+@@ -1618,19 +1633,20 @@
  	return 0;
  }
  
@@ -118,31 +111,29 @@ diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/mmu.c linux-4.18.13_3/arch/x86/k
  	struct kvm_rmap_head *rmap_head;
  	int i;
 -	bool write_protected = false;
--
--	for (i = PT_PAGE_TABLE_LEVEL; i <= PT_MAX_HUGEPAGE_LEVEL; ++i) {
 +	bool protected = false;
-+        for (i = PT_PAGE_TABLE_LEVEL; i <= PT_MAX_HUGEPAGE_LEVEL; ++i) {
+ 
+ 	for (i = PT_PAGE_TABLE_LEVEL; i <= PT_MAX_HUGEPAGE_LEVEL; ++i) {
  		rmap_head = __gfn_to_rmap(gfn, i, slot);
 -		write_protected |= __rmap_write_protect(kvm, rmap_head, true);
-+                protected |= __rmap_protect(kvm, rmap_head, true, mode);
++        	protected |= __rmap_protect(kvm, rmap_head, true, mode);
  	}
--
+ 
 -	return write_protected;
--}
 +	return protected;
-+  }
+ }
  
  static bool rmap_write_protect(struct kvm_vcpu *vcpu, u64 gfn)
- {
+@@ -1638,7 +1654,7 @@
  	struct kvm_memory_slot *slot;
  
  	slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
 -	return kvm_mmu_slot_gfn_write_protect(vcpu->kvm, slot, gfn);
-+        return kvm_mmu_slot_gfn_protect (vcpu->kvm, slot, gfn, KVM_PAGE_TRACK_WRITE);
++	return kvm_mmu_slot_gfn_protect(vcpu->kvm, slot, gfn, KVM_PAGE_TRACK_WRITE);
  }
  
  static bool kvm_zap_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head)
-@@ -2999,7 +3014,7 @@
+@@ -2999,7 +3015,7 @@
  	__direct_pte_prefetch(vcpu, sp, sptep);
  }
  
@@ -151,7 +142,7 @@ diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/mmu.c linux-4.18.13_3/arch/x86/k
  			int level, gfn_t gfn, kvm_pfn_t pfn, bool prefault)
  {
  	struct kvm_shadow_walk_iterator iterator;
-@@ -3753,12 +3768,47 @@
+@@ -3753,12 +3769,46 @@
  static bool page_fault_handle_page_track(struct kvm_vcpu *vcpu,
  					 u32 error_code, gfn_t gfn)
  {
@@ -181,12 +172,11 @@ diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/mmu.c linux-4.18.13_3/arch/x86/k
 +                                access_buffer_curr->error_code = error_code;
 +                                //check for overflow and increment pointer
 +                                if (unlikely(access_buffer_curr >= (access_buffer + MAX_SEV_BUF_SIZE - 1))){
-+                                    printk("SEVered: Attention, ring buffer overflow!\n");
-+                                    access_buffer_overflow = true;
-+                                    access_buffer_curr = access_buffer;
-+                                }
-+                                else
-+                                    access_buffer_curr += 1;
++                                	printk("SEVered: Attention, ring buffer overflow!\n");
++                                	access_buffer_overflow = true;
++                                	access_buffer_curr = access_buffer;
++                                } else
++                                	access_buffer_curr += 1;
 +                                spin_unlock(&tracking_lock);
 +			} else {
 +				srcu_read_unlock(&vcpu->kvm->srcu, idx);
@@ -209,23 +199,23 @@ diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/mmu.c linux-4.18.13_3/arch/x86/k
  }
  
  void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
-diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/mmu.h linux-4.18.13_3/arch/x86/kvm/mmu.h
---- linux-4.18.13_baseline_2/arch/x86/kvm/mmu.h	2019-06-07 14:17:04.671929654 +0200
-+++ linux-4.18.13_3/arch/x86/kvm/mmu.h	2019-09-06 16:07:58.786371036 +0200
+diff -ruN linux-4.18.13.orig/arch/x86/kvm/mmu.h linux-4.18.13.patched/arch/x86/kvm/mmu.h
+--- linux-4.18.13.orig/arch/x86/kvm/mmu.h	2018-10-10 08:56:08.000000000 +0200
++++ linux-4.18.13.patched/arch/x86/kvm/mmu.h	2019-09-18 11:36:23.619238227 +0200
 @@ -191,7 +191,8 @@
  
  void kvm_mmu_gfn_disallow_lpage(struct kvm_memory_slot *slot, gfn_t gfn);
  void kvm_mmu_gfn_allow_lpage(struct kvm_memory_slot *slot, gfn_t gfn);
 -bool kvm_mmu_slot_gfn_write_protect(struct kvm *kvm,
 -				    struct kvm_memory_slot *slot, u64 gfn);
-+bool kvm_mmu_slot_gfn_protect (struct kvm *kvm,
++bool kvm_mmu_slot_gfn_protect(struct kvm *kvm,
 +			       struct kvm_memory_slot *slot, u64 gfn,
 +			       enum kvm_page_track_mode mode);
  int kvm_arch_write_log_dirty(struct kvm_vcpu *vcpu);
  #endif
-diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/page_track.c linux-4.18.13_3/arch/x86/kvm/page_track.c
---- linux-4.18.13_baseline_2/arch/x86/kvm/page_track.c	2019-06-07 14:17:04.671929654 +0200
-+++ linux-4.18.13_3/arch/x86/kvm/page_track.c	2019-09-06 16:07:58.786371036 +0200
+diff -ruN linux-4.18.13.orig/arch/x86/kvm/page_track.c linux-4.18.13.patched/arch/x86/kvm/page_track.c
+--- linux-4.18.13.orig/arch/x86/kvm/page_track.c	2018-10-10 08:56:08.000000000 +0200
++++ linux-4.18.13.patched/arch/x86/kvm/page_track.c	2019-09-18 11:14:03.780190101 +0200
 @@ -105,9 +105,9 @@
  	 */
  	kvm_mmu_gfn_disallow_lpage(slot, gfn);
@@ -235,13 +225,13 @@ diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/page_track.c linux-4.18.13_3/arc
 -			kvm_flush_remote_tlbs(kvm);
 +        //here the modes are KVM_PAGE_TRACK_WRITE or KVM_PAGE_TRACK_ACCESS
 +        if (kvm_mmu_slot_gfn_protect(kvm, slot, gfn, mode))
-+          kvm_flush_remote_tlbs(kvm);
++        	kvm_flush_remote_tlbs(kvm);
  }
  EXPORT_SYMBOL_GPL(kvm_slot_page_track_add_page);
  
-diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/svm.c linux-4.18.13_3/arch/x86/kvm/svm.c
---- linux-4.18.13_baseline_2/arch/x86/kvm/svm.c	2019-06-07 14:17:04.671929654 +0200
-+++ linux-4.18.13_3/arch/x86/kvm/svm.c	2019-09-06 16:07:58.786371036 +0200
+diff -ruN linux-4.18.13.orig/arch/x86/kvm/svm.c linux-4.18.13.patched/arch/x86/kvm/svm.c
+--- linux-4.18.13.orig/arch/x86/kvm/svm.c	2018-10-10 08:56:08.000000000 +0200
++++ linux-4.18.13.patched/arch/x86/kvm/svm.c	2019-09-18 11:15:44.692065321 +0200
 @@ -54,6 +54,8 @@
  #include <asm/virtext.h>
  #include "trace.h"
@@ -261,18 +251,17 @@ diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/svm.c linux-4.18.13_3/arch/x86/k
  struct kvm_sev_info {
  	bool active;		/* SEV enabled guest */
  	unsigned int asid;	/* ASID used for this guest */
-@@ -4898,6 +4903,32 @@
+@@ -4898,6 +4903,31 @@
  	struct vcpu_svm *svm = to_svm(vcpu);
  	struct kvm_run *kvm_run = vcpu->run;
  	u32 exit_code = svm->vmcb->control.exit_code;
 +        long severed_retval;
 +
 +        spin_lock(&severed_action_lock);
-+        switch (severed_action) {
++       	switch (severed_action) {
 +		case SEVERED_NONE:
 +			break;
 +		case SEVERED_STARTTR:
-+		   printk (KERN_DEBUG "SEVered: I am here in svm.c handle_exit case SEVERED_STARTTR\n");
 +			severed_retval = kvm_start_tracking(vcpu);
 +			break;
 +		case SEVERED_STOPTR:
@@ -294,14 +283,13 @@ diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/svm.c linux-4.18.13_3/arch/x86/k
  
  	trace_kvm_exit(exit_code, vcpu, KVM_ISA_SVM);
  
-diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/vmx.c linux-4.18.13_3/arch/x86/kvm/vmx.c
---- linux-4.18.13_baseline_2/arch/x86/kvm/vmx.c	2019-06-07 14:17:04.671929654 +0200
-+++ linux-4.18.13_3/arch/x86/kvm/vmx.c	2019-09-06 16:07:58.786371036 +0200
-@@ -54,6 +54,12 @@
+diff -ruN linux-4.18.13.orig/arch/x86/kvm/vmx.c linux-4.18.13.patched/arch/x86/kvm/vmx.c
+--- linux-4.18.13.orig/arch/x86/kvm/vmx.c	2018-10-10 08:56:08.000000000 +0200
++++ linux-4.18.13.patched/arch/x86/kvm/vmx.c	2019-09-18 11:50:34.630360689 +0200
+@@ -54,6 +54,11 @@
  #include <asm/spec-ctrl.h>
  #include <asm/mshyperv.h>
  
-+
 +#include <linux/severed.h>
 +extern int severed_action;
 +extern int severed_pid_from_shell;
@@ -310,54 +298,51 @@ diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/vmx.c linux-4.18.13_3/arch/x86/k
  #include "trace.h"
  #include "pmu.h"
  #include "vmx_evmcs.h"
-@@ -9640,6 +9646,44 @@
+@@ -9640,6 +9645,41 @@
  	u32 exit_reason = vmx->exit_reason;
  	u32 vectoring_info = vmx->idt_vectoring_info;
  
-+        pid_t  severed_vm_pid = vcpu -> kvm -> userspace_pid;
-+        long severed_retval;
++	pid_t  severed_vm_pid = vcpu -> kvm -> userspace_pid;
++	long severed_retval;
 +
-+        //i j to print out memslots
-+        //int i,j;
-+
-+        spin_lock(&severed_action_lock);
-+        switch (severed_action) {
-+	case SEVERED_NONE:
-+	  break;
-+	case SEVERED_STARTTR:
-+          //if the process id (pid) of the vm coincides with the pid given from the shell then start tracking
-+          if (severed_vm_pid == severed_pid_from_shell) {
-+            severed_retval = kvm_start_tracking(vcpu);
-+            severed_action = SEVERED_NONE;
-+          }
-+          break;
-+	case SEVERED_STOPTR:
-+          if (severed_vm_pid == severed_pid_from_shell) {
-+            severed_retval = kvm_stop_tracking(vcpu);
-+            severed_action = SEVERED_NONE;
-+          }
-+	  break;
-+        case SEVERED_CHGMP:
-+          if (severed_vm_pid == severed_pid_from_shell) {
-+            severed_retval = kvm_change_mapping(vcpu);
-+            if ( severed_retval == 1 ) {
-+              vmx_flush_tlb(vcpu, true);
-+              //Success message required to inform userspace tools about suceeded remapping
-+              //TODO: Cleaner implementation replaces this feedback with an appropriate feedback mechanism 
-+              //(e.g., via ioctl)
-+              printk("SEVered: in %s, found valid mapping for gfn for the vm with the pid %d\n", __func__, severed_vm_pid);
-+            }
-+            severed_action = SEVERED_NONE;
-+          }
-+	  break;
++	spin_lock(&severed_action_lock);
++	switch (severed_action) {
++		case SEVERED_NONE:
++			break;
++		case SEVERED_STARTTR:
++        		//if the process id (pid) of the vm matches the given pid, start tracking
++          		if (severed_vm_pid == severed_pid_from_shell) {
++            			severed_retval = kvm_start_tracking(vcpu);
++ 				severed_action = SEVERED_NONE;
++          		}
++          		break;
++		case SEVERED_STOPTR:
++        		if (severed_vm_pid == severed_pid_from_shell) {
++            			severed_retval = kvm_stop_tracking(vcpu);
++           			severed_action = SEVERED_NONE;
++          		}
++	  		break;
++		case SEVERED_CHGMP:
++        		if (severed_vm_pid == severed_pid_from_shell) {
++            			severed_retval = kvm_change_mapping(vcpu);
++            			if ( severed_retval == 1 ) {
++              				vmx_flush_tlb(vcpu, true);
++              				//Success message required to inform userspace tools about suceeded remapping
++              				//TODO: Cleaner implementation replaces this feedback with an appropriate feedback mechanism 
++              				//(e.g., via ioctl)
++              				printk("SEVered: in %s, found valid mapping for gfn for the vm with the pid %d\n", __func__, severed_vm_pid);
++            			}
++            			severed_action = SEVERED_NONE;
++          		}
++	  		break;
 +        }
 +        spin_unlock(&severed_action_lock);
  	trace_kvm_exit(exit_reason, vcpu, KVM_ISA_VMX);
  
  	/*
-diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/x86.c linux-4.18.13_3/arch/x86/kvm/x86.c
---- linux-4.18.13_baseline_2/arch/x86/kvm/x86.c	2019-06-07 14:17:04.671929654 +0200
-+++ linux-4.18.13_3/arch/x86/kvm/x86.c	2019-09-06 16:07:58.786371036 +0200
+diff -ruN linux-4.18.13.orig/arch/x86/kvm/x86.c linux-4.18.13.patched/arch/x86/kvm/x86.c
+--- linux-4.18.13.orig/arch/x86/kvm/x86.c	2018-10-10 08:56:08.000000000 +0200
++++ linux-4.18.13.patched/arch/x86/kvm/x86.c	2019-09-18 11:40:13.731012431 +0200
 @@ -69,6 +69,7 @@
  #include <asm/irq_remapping.h>
  #include <asm/mshyperv.h>
@@ -452,34 +437,34 @@ diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/x86.c linux-4.18.13_3/arch/x86/k
 +
 +	//Print the time when tracking was stopped. 
 +	//Required to calculate time offset of memory accesses in evaluation
-+        printk("SEVered:basetime:%lld.%09lld\n", severed_stop_time/comma_separator, severed_stop_time%comma_separator); 
++	printk("SEVered:basetime:%lld.%09lld\n", severed_stop_time/comma_separator, severed_stop_time%comma_separator); 
 +
 +	//Print all tracked pages in the ring buffer
-+        spin_lock(&tracking_lock);
++	spin_lock(&tracking_lock);
 +
 +	//If ring buffer is full, start with the last tracked page
-+        if (access_buffer_overflow) {
-+            pos = access_buffer_curr;
-+            while (pos < access_buffer + MAX_SEV_BUF_SIZE){
-+                if (pos->time <= severed_stop_time)
-+                  printk("SEVered:%d:%06llx:%02x:%lld.%09lld\n", severed_vm_pid, pos->gfn, pos->error_code, pos->time/comma_separator, pos->time%comma_separator);
-+                pos->gfn = 0;
-+                pos->error_code = 0;
-+                pos->time = 0;
-+                pos++;
-+            }
++	if (access_buffer_overflow) {
++        	pos = access_buffer_curr;
++            	while (pos < access_buffer + MAX_SEV_BUF_SIZE){
++                	if (pos->time <= severed_stop_time)
++                  		printk("SEVered:%d:%06llx:%02x:%lld.%09lld\n", severed_vm_pid, pos->gfn, pos->error_code, pos->time/comma_separator, pos->time%comma_separator);
++                	pos->gfn = 0;
++                	pos->error_code = 0;
++                	pos->time = 0;
++                	pos++;
++            	}
 +        }
 +
 +        pos = access_buffer;
 +
 +	//Print the content of the ring buffer
-+        while (pos < access_buffer_curr){
-+            if (pos->time <= severed_stop_time)
-+              printk("SEVered:%d:%06llx:%02x:%lld.%09lld\n", severed_vm_pid, pos->gfn, pos->error_code, pos->time/comma_separator, pos->time%comma_separator);
-+            pos->gfn = 0;
-+            pos->error_code = 0;
-+            pos->time = 0;
-+            pos++;
++	while (pos < access_buffer_curr){
++        	if (pos->time <= severed_stop_time)
++              		printk("SEVered:%d:%06llx:%02x:%lld.%09lld\n", severed_vm_pid, pos->gfn, pos->error_code, pos->time/comma_separator, pos->time%comma_separator);
++            	pos->gfn = 0;
++            	pos->error_code = 0;
++            	pos->time = 0;
++            	pos++;
 +        }
 +
 +        access_buffer_curr = access_buffer;
@@ -543,55 +528,29 @@ diff -ruN linux-4.18.13_baseline_2/arch/x86/kvm/x86.c linux-4.18.13_3/arch/x86/k
 +        } else {
 +		//Inform user space that remapping failed
 +		//See TODO in svm.c
-+                printk("SEVered: in %s, no valid mapping found for gfn 0x%016llx (pfn: 0x%016llx)\n", __func__, gfn2, pfn2);
++		printk("SEVered: in %s, no valid mapping found for gfn 0x%016llx (pfn: 0x%016llx)\n", __func__, gfn2, pfn2);
 +	}
 +
-+        return 0;
++	return 0;
 +}
 +EXPORT_SYMBOL(kvm_change_mapping);
 +
  long kvm_arch_dev_ioctl(struct file *filp,
  			unsigned int ioctl, unsigned long arg)
  {
-@@ -7428,7 +7602,7 @@
- 		}
- 	}
- 
--	r = kvm_mmu_reload(vcpu);
-+        r = kvm_mmu_reload(vcpu);
- 	if (unlikely(r)) {
- 		goto cancel_injection;
- 	}
-@@ -7699,7 +7873,7 @@
-  *   for each fragment
-  *     for each mmio piece in the fragment
-  *       write gpa, len
-- *       copy data
-+*       copy data
-  *       exit
-  */
- static int complete_emulated_mmio(struct kvm_vcpu *vcpu)
-diff -ruN linux-4.18.13_baseline_2/include/linux/kvm_host.h linux-4.18.13_3/include/linux/kvm_host.h
---- linux-4.18.13_baseline_2/include/linux/kvm_host.h	2019-06-07 14:17:05.859927677 +0200
-+++ linux-4.18.13_3/include/linux/kvm_host.h	2019-09-06 16:07:59.410371117 +0200
-@@ -584,7 +584,6 @@
- static inline struct kvm_memslots *kvm_vcpu_memslots(struct kvm_vcpu *vcpu)
- {
- 	int as_id = kvm_arch_vcpu_memslots_id(vcpu);
--
- 	return __kvm_memslots(vcpu->kvm, as_id);
- }
- 
-@@ -1288,3 +1287,6 @@
+diff -ruN linux-4.18.13.orig/include/linux/kvm_host.h linux-4.18.13.patched/include/linux/kvm_host.h
+--- linux-4.18.13.orig/include/linux/kvm_host.h	2018-10-10 08:56:08.000000000 +0200
++++ linux-4.18.13.patched/include/linux/kvm_host.h	2019-09-18 11:23:32.995809913 +0200
+@@ -1288,3 +1288,6 @@
  #endif /* CONFIG_HAVE_KVM_VCPU_RUN_PID_CHANGE */
  
  #endif
 +
 +int __direct_map(struct kvm_vcpu *vcpu, int write, int map_writable,
 +                        int level, gfn_t gfn, kvm_pfn_t pfn, bool prefault); 
-diff -ruN linux-4.18.13_baseline_2/include/linux/severed.h linux-4.18.13_3/include/linux/severed.h
---- linux-4.18.13_baseline_2/include/linux/severed.h	1970-01-01 01:00:00.000000000 +0100
-+++ linux-4.18.13_3/include/linux/severed.h	2019-09-06 16:07:59.410371117 +0200
+diff -ruN linux-4.18.13.orig/include/linux/severed.h linux-4.18.13.patched/include/linux/severed.h
+--- linux-4.18.13.orig/include/linux/severed.h	1970-01-01 01:00:00.000000000 +0100
++++ linux-4.18.13.patched/include/linux/severed.h	2019-09-18 11:05:35.280805600 +0200
 @@ -0,0 +1,22 @@
 +#ifndef __SEVERED_H
 +#define __SEVERED_H
@@ -615,10 +574,10 @@ diff -ruN linux-4.18.13_baseline_2/include/linux/severed.h linux-4.18.13_3/inclu
 +long kvm_stop_tracking(struct kvm_vcpu *vcpu);
 +long kvm_change_mapping(struct kvm_vcpu *vcpu);
 +#endif
-diff -ruN linux-4.18.13_baseline_2/include/uapi/linux/kvm.h linux-4.18.13_3/include/uapi/linux/kvm.h
---- linux-4.18.13_baseline_2/include/uapi/linux/kvm.h	2019-06-07 14:17:05.915927583 +0200
-+++ linux-4.18.13_3/include/uapi/linux/kvm.h	2019-09-06 16:07:59.454371123 +0200
-@@ -60,6 +60,22 @@
+diff -ruN linux-4.18.13.orig/include/uapi/linux/kvm.h linux-4.18.13.patched/include/uapi/linux/kvm.h
+--- linux-4.18.13.orig/include/uapi/linux/kvm.h	2018-10-10 08:56:08.000000000 +0200
++++ linux-4.18.13.patched/include/uapi/linux/kvm.h	2019-09-18 11:51:24.610306745 +0200
+@@ -60,6 +60,21 @@
  	__u32 buf_nr;
  };
  
@@ -632,16 +591,15 @@ diff -ruN linux-4.18.13_baseline_2/include/uapi/linux/kvm.h linux-4.18.13_3/incl
 +     
 +} mapping_change_param_t;
 +
-+//for the cases KVM_TRACKING_ENABLE and KVM_TRACKING_DISABLE
++//for KVM_TRACKING_ENABLE and KVM_TRACKING_DISABLE
 +typedef struct str_pid_param {
 +    char str_pid[16];
 +} str_pid_param_t;
 +
-+
  #define __KVM_DEPRECATED_MAIN_W_0x06 \
  	_IOW(KVMIO, 0x06, struct kvm_user_trace_setup)
  #define __KVM_DEPRECATED_MAIN_0x07 _IO(KVMIO, 0x07)
-@@ -774,6 +790,10 @@
+@@ -774,6 +789,10 @@
  #define KVM_GET_EMULATED_CPUID	  _IOWR(KVMIO, 0x09, struct kvm_cpuid2)
  #define KVM_GET_MSR_FEATURE_INDEX_LIST    _IOWR(KVMIO, 0x0a, struct kvm_msr_list)
  
@@ -652,9 +610,9 @@ diff -ruN linux-4.18.13_baseline_2/include/uapi/linux/kvm.h linux-4.18.13_3/incl
  /*
   * Extension capability list.
   */
-diff -ruN linux-4.18.13_baseline_2/virt/kvm/kvm_main.c linux-4.18.13_3/virt/kvm/kvm_main.c
---- linux-4.18.13_baseline_2/virt/kvm/kvm_main.c	2019-06-07 14:17:05.831927722 +0200
-+++ linux-4.18.13_3/virt/kvm/kvm_main.c	2019-09-06 16:07:59.586371140 +0200
+diff -ruN linux-4.18.13.orig/virt/kvm/kvm_main.c linux-4.18.13.patched/virt/kvm/kvm_main.c
+--- linux-4.18.13.orig/virt/kvm/kvm_main.c	2018-10-10 08:56:08.000000000 +0200
++++ linux-4.18.13.patched/virt/kvm/kvm_main.c	2019-09-18 11:51:42.806287073 +0200
 @@ -62,6 +62,8 @@
  #include "async_pf.h"
  #include "vfio.h"
@@ -697,99 +655,98 @@ diff -ruN linux-4.18.13_baseline_2/virt/kvm/kvm_main.c linux-4.18.13_3/virt/kvm/
  
  	switch (ioctl) {
  	case KVM_GET_API_VERSION:
-@@ -3249,6 +3270,95 @@
+@@ -3249,6 +3270,93 @@
  	case KVM_TRACE_DISABLE:
  		r = -EOPNOTSUPP;
  		break;
 +                
 +        case KVM_TRACKING_ENABLE:
-+          argp = (void __user *) arg;
-+          spin_lock(&severed_action_lock);
-+          if (severed_action == SEVERED_NONE) {
-+            if (copy_from_user (severed_strpid_param.str_pid, argp, sizeof(severed_strpid_param)))
-+              return -EFAULT;
-+            n = strlen (severed_strpid_param.str_pid);
-+            ret = kstrtol (severed_strpid_param.str_pid, 10, &long_num_for_pid);
-+            if (ret) {
-+              printk("SEVered: invalid pid for KVM_TRACKING_ENABLE\n");
-+              severed_action = SEVERED_NONE;
-+            }
-+            else {
-+              severed_pid_from_shell = (pid_t)long_num_for_pid;
-+              severed_action = SEVERED_STARTTR;
-+            }
-+            r = 0;
-+          }                
-+          spin_unlock(&severed_action_lock);
-+          break;
++          	argp = (void __user *) arg;
++          	spin_lock(&severed_action_lock);
++          	if (severed_action == SEVERED_NONE) {
++            		if (copy_from_user (severed_strpid_param.str_pid, argp, sizeof(severed_strpid_param)))
++              			return -EFAULT;
++            		n = strlen (severed_strpid_param.str_pid);
++            		ret = kstrtol (severed_strpid_param.str_pid, 10, &long_num_for_pid);
++            		if (ret) {
++              			printk("SEVered: invalid pid for KVM_TRACKING_ENABLE\n");
++              			severed_action = SEVERED_NONE;
++            		} else {
++              			severed_pid_from_shell = (pid_t)long_num_for_pid;
++              			severed_action = SEVERED_STARTTR;
++            		}
++            		r = 0;
++          	}                
++          	spin_unlock(&severed_action_lock);
++          	break;
 +          
 +        case KVM_TRACKING_DISABLE:
 +                severed_stop_time = ktime_get();
 +                argp = (void __user *) arg;
 +                spin_lock(&severed_action_lock);
 +                if (severed_action == SEVERED_NONE) {
-+                  if (copy_from_user (severed_strpid_param.str_pid, argp, sizeof(severed_strpid_param)))
-+                    return -EFAULT;
-+                  ret = kstrtol (severed_strpid_param.str_pid, 10, &long_num_for_pid);
-+                  if (ret) {
-+                    printk ("SEVered: invalid pid for KVM_TRACKING_DISABLE\n");
-+                    severed_action = SEVERED_NONE;
-+                  }
-+                  else {
-+                    severed_pid_from_shell = (pid_t)long_num_for_pid;
-+                    severed_action = SEVERED_STOPTR;
-+                  }
-+                  r = 0;
++                	if (copy_from_user (severed_strpid_param.str_pid, argp, sizeof(severed_strpid_param)))
++                    		return -EFAULT;
++                  	ret = kstrtol (severed_strpid_param.str_pid, 10, &long_num_for_pid);
++                  	if (ret) {
++                    		printk ("SEVered: invalid pid for KVM_TRACKING_DISABLE\n");
++                    		severed_action = SEVERED_NONE;
++                  	} else {
++                    		severed_pid_from_shell = (pid_t)long_num_for_pid;
++                    		severed_action = SEVERED_STOPTR;
++                  	}
++                  	r = 0;
 +                }
 +                spin_unlock(&severed_action_lock);
 +                break;
 +                
 +        case KVM_MAPPING_CHANGE:
-+          argp = (void __user *)arg;
-+          spin_lock(&severed_action_lock);
-+          if (severed_action == SEVERED_NONE) {
-+            if (copy_from_user(&line, argp, sizeof(line)))
-+              return -EFAULT;
-+            p = line;
-+            c = strsep(&p, ",");
-+            if (!c) {
-+              printk ("SEVered: something wrong with the input for the case KVM_MAPPING_CHANGE, example: 4537,000023a5,0000f365  where pid,gfn1,gfn2\n");
-+              r = 0;
-+              spin_unlock(&severed_action_lock);
-+              break;
-+            }
-+            n = strlen(c);
-+            memcpy (severed_change_param.str_pid, c, n);
-+            severed_change_param.str_pid[n] = '\0';
-+            ret = kstrtol (severed_change_param.str_pid, 10, &long_num_for_pid);
-+            if (ret) {
-+              printk("SEVered: invalid pid for KVM_MAPPING_CHANGE \n");
-+              r = 0;
-+              spin_unlock(&severed_action_lock);
-+              break;
-+            }
-+            severed_pid_from_shell = (pid_t)long_num_for_pid;
-+            c = strsep(&p, ",");
-+            if (!c) {
-+              printk ("SEVered: something wrong with the input for the case KVM_MAPPING_CHANGE, example: 4537,000023a5,0000f365  where pid,gfn1,gfn2\n");
-+              r = 0;
-+              spin_unlock(&severed_action_lock);
-+              break;
-+            }
-+            memcpy(severed_change_param.gfn1, c, 8);
-+            c = strsep(&p, ",");
-+            if (!c) {
-+              printk ("SEVered: something wrong with the input for the case KVM_MAPPING_CHANGE, example: 4537,000023a5,0000f365  where pid,gfn1,gfn2\n");
-+              r = 0;
-+              spin_unlock(&severed_action_lock);
-+              break;
-+            }
-+            memcpy(severed_change_param.gfn2, c, 8);
-+            severed_action = SEVERED_CHGMP;
-+            r = 0;
-+          }
-+          spin_unlock(&severed_action_lock);
-+          break;
++        	argp = (void __user *)arg;
++        	spin_lock(&severed_action_lock);
++        	if (severed_action == SEVERED_NONE) {
++            		if (copy_from_user(&line, argp, sizeof(line)))
++              			return -EFAULT;
++            		p = line;
++            		c = strsep(&p, ",");
++            		if (!c) {
++              			printk ("SEVered: Wrong parameters for KVM_MAPPING_CHANGE. Example: 4537,000023a5,0000f365 (pid,gfn1,gfn2)\n");
++              			r = 0;
++              			spin_unlock(&severed_action_lock);
++              			break;
++            		}
++            		n = strlen(c);
++            		memcpy (severed_change_param.str_pid, c, n);
++            		severed_change_param.str_pid[n] = '\0';
++            		ret = kstrtol (severed_change_param.str_pid, 10, &long_num_for_pid);
++            		if (ret) {
++              			printk("SEVered: invalid pid for KVM_MAPPING_CHANGE\n");
++              			r = 0;
++              			spin_unlock(&severed_action_lock);
++              			break;
++            		}
++            		severed_pid_from_shell = (pid_t)long_num_for_pid;
++            		c = strsep(&p, ",");
++            		if (!c) {
++              			printk ("SEVered: Invalid gfn1 for for KVM_MAPPING_CHANGE. Example: 000023a5\n");
++              			r = 0;
++              			spin_unlock(&severed_action_lock);
++              			break;
++            		}
++            		memcpy(severed_change_param.gfn1, c, 8);
++            		c = strsep(&p, ",");
++            		if (!c) {
++              			printk ("SEVered: Invalid gfn2 for for KVM_MAPPING_CHANGE. Example: 000023a5\n");
++              			r = 0;
++              			spin_unlock(&severed_action_lock);
++             	 		break;
++            		}
++            		memcpy(severed_change_param.gfn2, c, 8);
++            		severed_action = SEVERED_CHGMP;
++            		r = 0;
++          	}
++          	spin_unlock(&severed_action_lock);
++          	break;
  	default:
  		return kvm_arch_dev_ioctl(filp, ioctl, arg);
  	}
+Binary files linux-4.18.13.orig/virt/kvm/.kvm_main.c.swp and linux-4.18.13.patched/virt/kvm/.kvm_main.c.swp differ
