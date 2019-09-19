@@ -1,5 +1,5 @@
-diff -ruN linux-4.18.13.orig/arch/x86/include/asm/kvm_page_track.h linux-4.18.13.patched/arch/x86/include/asm/kvm_page_track.h
---- linux-4.18.13.orig/arch/x86/include/asm/kvm_page_track.h	2018-10-10 08:56:08.000000000 +0200
+diff -ruN linux-4.18.13/arch/x86/include/asm/kvm_page_track.h linux-4.18.13.patched/arch/x86/include/asm/kvm_page_track.h
+--- linux-4.18.13/arch/x86/include/asm/kvm_page_track.h	2018-10-10 08:56:08.000000000 +0200
 +++ linux-4.18.13.patched/arch/x86/include/asm/kvm_page_track.h	2019-09-18 11:05:35.272805610 +0200
 @@ -4,6 +4,7 @@
  
@@ -9,8 +9,8 @@ diff -ruN linux-4.18.13.orig/arch/x86/include/asm/kvm_page_track.h linux-4.18.13
  	KVM_PAGE_TRACK_MAX,
  };
  
-diff -ruN linux-4.18.13.orig/arch/x86/kvm/mmu.c linux-4.18.13.patched/arch/x86/kvm/mmu.c
---- linux-4.18.13.orig/arch/x86/kvm/mmu.c	2018-10-10 08:56:08.000000000 +0200
+diff -ruN linux-4.18.13/arch/x86/kvm/mmu.c linux-4.18.13.patched/arch/x86/kvm/mmu.c
+--- linux-4.18.13/arch/x86/kvm/mmu.c	2018-10-10 08:56:08.000000000 +0200
 +++ linux-4.18.13.patched/arch/x86/kvm/mmu.c	2019-09-18 11:47:28.370560316 +0200
 @@ -40,6 +40,7 @@
  #include <linux/uaccess.h>
@@ -199,8 +199,8 @@ diff -ruN linux-4.18.13.orig/arch/x86/kvm/mmu.c linux-4.18.13.patched/arch/x86/k
  }
  
  void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
-diff -ruN linux-4.18.13.orig/arch/x86/kvm/mmu.h linux-4.18.13.patched/arch/x86/kvm/mmu.h
---- linux-4.18.13.orig/arch/x86/kvm/mmu.h	2018-10-10 08:56:08.000000000 +0200
+diff -ruN linux-4.18.13/arch/x86/kvm/mmu.h linux-4.18.13.patched/arch/x86/kvm/mmu.h
+--- linux-4.18.13/arch/x86/kvm/mmu.h	2018-10-10 08:56:08.000000000 +0200
 +++ linux-4.18.13.patched/arch/x86/kvm/mmu.h	2019-09-18 11:36:23.619238227 +0200
 @@ -191,7 +191,8 @@
  
@@ -213,8 +213,8 @@ diff -ruN linux-4.18.13.orig/arch/x86/kvm/mmu.h linux-4.18.13.patched/arch/x86/k
 +			       enum kvm_page_track_mode mode);
  int kvm_arch_write_log_dirty(struct kvm_vcpu *vcpu);
  #endif
-diff -ruN linux-4.18.13.orig/arch/x86/kvm/page_track.c linux-4.18.13.patched/arch/x86/kvm/page_track.c
---- linux-4.18.13.orig/arch/x86/kvm/page_track.c	2018-10-10 08:56:08.000000000 +0200
+diff -ruN linux-4.18.13/arch/x86/kvm/page_track.c linux-4.18.13.patched/arch/x86/kvm/page_track.c
+--- linux-4.18.13/arch/x86/kvm/page_track.c	2018-10-10 08:56:08.000000000 +0200
 +++ linux-4.18.13.patched/arch/x86/kvm/page_track.c	2019-09-18 11:14:03.780190101 +0200
 @@ -105,9 +105,9 @@
  	 */
@@ -229,8 +229,8 @@ diff -ruN linux-4.18.13.orig/arch/x86/kvm/page_track.c linux-4.18.13.patched/arc
  }
  EXPORT_SYMBOL_GPL(kvm_slot_page_track_add_page);
  
-diff -ruN linux-4.18.13.orig/arch/x86/kvm/svm.c linux-4.18.13.patched/arch/x86/kvm/svm.c
---- linux-4.18.13.orig/arch/x86/kvm/svm.c	2018-10-10 08:56:08.000000000 +0200
+diff -ruN linux-4.18.13/arch/x86/kvm/svm.c linux-4.18.13.patched/arch/x86/kvm/svm.c
+--- linux-4.18.13/arch/x86/kvm/svm.c	2018-10-10 08:56:08.000000000 +0200
 +++ linux-4.18.13.patched/arch/x86/kvm/svm.c	2019-09-18 11:15:44.692065321 +0200
 @@ -54,6 +54,8 @@
  #include <asm/virtext.h>
@@ -283,8 +283,8 @@ diff -ruN linux-4.18.13.orig/arch/x86/kvm/svm.c linux-4.18.13.patched/arch/x86/k
  
  	trace_kvm_exit(exit_code, vcpu, KVM_ISA_SVM);
  
-diff -ruN linux-4.18.13.orig/arch/x86/kvm/vmx.c linux-4.18.13.patched/arch/x86/kvm/vmx.c
---- linux-4.18.13.orig/arch/x86/kvm/vmx.c	2018-10-10 08:56:08.000000000 +0200
+diff -ruN linux-4.18.13/arch/x86/kvm/vmx.c linux-4.18.13.patched/arch/x86/kvm/vmx.c
+--- linux-4.18.13/arch/x86/kvm/vmx.c	2018-10-10 08:56:08.000000000 +0200
 +++ linux-4.18.13.patched/arch/x86/kvm/vmx.c	2019-09-18 11:50:34.630360689 +0200
 @@ -54,6 +54,11 @@
  #include <asm/spec-ctrl.h>
@@ -340,8 +340,8 @@ diff -ruN linux-4.18.13.orig/arch/x86/kvm/vmx.c linux-4.18.13.patched/arch/x86/k
  	trace_kvm_exit(exit_reason, vcpu, KVM_ISA_VMX);
  
  	/*
-diff -ruN linux-4.18.13.orig/arch/x86/kvm/x86.c linux-4.18.13.patched/arch/x86/kvm/x86.c
---- linux-4.18.13.orig/arch/x86/kvm/x86.c	2018-10-10 08:56:08.000000000 +0200
+diff -ruN linux-4.18.13/arch/x86/kvm/x86.c linux-4.18.13.patched/arch/x86/kvm/x86.c
+--- linux-4.18.13/arch/x86/kvm/x86.c	2018-10-10 08:56:08.000000000 +0200
 +++ linux-4.18.13.patched/arch/x86/kvm/x86.c	2019-09-18 11:40:13.731012431 +0200
 @@ -69,6 +69,7 @@
  #include <asm/irq_remapping.h>
@@ -538,8 +538,8 @@ diff -ruN linux-4.18.13.orig/arch/x86/kvm/x86.c linux-4.18.13.patched/arch/x86/k
  long kvm_arch_dev_ioctl(struct file *filp,
  			unsigned int ioctl, unsigned long arg)
  {
-diff -ruN linux-4.18.13.orig/include/linux/kvm_host.h linux-4.18.13.patched/include/linux/kvm_host.h
---- linux-4.18.13.orig/include/linux/kvm_host.h	2018-10-10 08:56:08.000000000 +0200
+diff -ruN linux-4.18.13/include/linux/kvm_host.h linux-4.18.13.patched/include/linux/kvm_host.h
+--- linux-4.18.13/include/linux/kvm_host.h	2018-10-10 08:56:08.000000000 +0200
 +++ linux-4.18.13.patched/include/linux/kvm_host.h	2019-09-18 11:23:32.995809913 +0200
 @@ -1288,3 +1288,6 @@
  #endif /* CONFIG_HAVE_KVM_VCPU_RUN_PID_CHANGE */
@@ -548,10 +548,15 @@ diff -ruN linux-4.18.13.orig/include/linux/kvm_host.h linux-4.18.13.patched/incl
 +
 +int __direct_map(struct kvm_vcpu *vcpu, int write, int map_writable,
 +                        int level, gfn_t gfn, kvm_pfn_t pfn, bool prefault); 
-diff -ruN linux-4.18.13.orig/include/linux/severed.h linux-4.18.13.patched/include/linux/severed.h
---- linux-4.18.13.orig/include/linux/severed.h	1970-01-01 01:00:00.000000000 +0100
-+++ linux-4.18.13.patched/include/linux/severed.h	2019-09-18 11:05:35.280805600 +0200
-@@ -0,0 +1,22 @@
+diff -ruN linux-4.18.13/include/linux/severed.h linux-4.18.13.patched/include/linux/severed.h
+--- linux-4.18.13/include/linux/severed.h	1970-01-01 01:00:00.000000000 +0100
++++ linux-4.18.13.patched/include/linux/severed.h	2019-09-19 10:22:16.137642171 +0200
+@@ -0,0 +1,27 @@
++/*
++ * This work is licensed under the terms of the GNU GPL, version 2.  See
++ * the COPYING file in the top-level directory.
++ */
++
 +#ifndef __SEVERED_H
 +#define __SEVERED_H
 +
@@ -574,8 +579,8 @@ diff -ruN linux-4.18.13.orig/include/linux/severed.h linux-4.18.13.patched/inclu
 +long kvm_stop_tracking(struct kvm_vcpu *vcpu);
 +long kvm_change_mapping(struct kvm_vcpu *vcpu);
 +#endif
-diff -ruN linux-4.18.13.orig/include/uapi/linux/kvm.h linux-4.18.13.patched/include/uapi/linux/kvm.h
---- linux-4.18.13.orig/include/uapi/linux/kvm.h	2018-10-10 08:56:08.000000000 +0200
+diff -ruN linux-4.18.13/include/uapi/linux/kvm.h linux-4.18.13.patched/include/uapi/linux/kvm.h
+--- linux-4.18.13/include/uapi/linux/kvm.h	2018-10-10 08:56:08.000000000 +0200
 +++ linux-4.18.13.patched/include/uapi/linux/kvm.h	2019-09-18 11:51:24.610306745 +0200
 @@ -60,6 +60,21 @@
  	__u32 buf_nr;
@@ -610,9 +615,9 @@ diff -ruN linux-4.18.13.orig/include/uapi/linux/kvm.h linux-4.18.13.patched/incl
  /*
   * Extension capability list.
   */
-diff -ruN linux-4.18.13.orig/virt/kvm/kvm_main.c linux-4.18.13.patched/virt/kvm/kvm_main.c
---- linux-4.18.13.orig/virt/kvm/kvm_main.c	2018-10-10 08:56:08.000000000 +0200
-+++ linux-4.18.13.patched/virt/kvm/kvm_main.c	2019-09-18 11:51:42.806287073 +0200
+diff -ruN linux-4.18.13/virt/kvm/kvm_main.c linux-4.18.13.patched/virt/kvm/kvm_main.c
+--- linux-4.18.13/virt/kvm/kvm_main.c	2018-10-10 08:56:08.000000000 +0200
++++ linux-4.18.13.patched/virt/kvm/kvm_main.c	2019-09-18 11:57:00.082332501 +0200
 @@ -62,6 +62,8 @@
  #include "async_pf.h"
  #include "vfio.h"
@@ -749,4 +754,3 @@ diff -ruN linux-4.18.13.orig/virt/kvm/kvm_main.c linux-4.18.13.patched/virt/kvm/
  	default:
  		return kvm_arch_dev_ioctl(filp, ioctl, arg);
  	}
-Binary files linux-4.18.13.orig/virt/kvm/.kvm_main.c.swp and linux-4.18.13.patched/virt/kvm/.kvm_main.c.swp differ
