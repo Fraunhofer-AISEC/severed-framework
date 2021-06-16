@@ -1,0 +1,1732 @@
+diff --git a/Makefile b/Makefile
+index 4d0711f54047..f5619280041d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -2,7 +2,7 @@
+ VERSION = 5
+ PATCHLEVEL = 6
+ SUBLEVEL = 0
+-EXTRAVERSION =
++EXTRAVERSION = -severed-framework
+ NAME = Kleptomaniac Octopus
+ 
+ # *DOCUMENTATION*
+diff --git a/arch/x86/include/asm/kvm_page_track.h b/arch/x86/include/asm/kvm_page_track.h
+index 172f9749dbb2..568faba6a674 100644
+--- a/arch/x86/include/asm/kvm_page_track.h
++++ b/arch/x86/include/asm/kvm_page_track.h
+@@ -4,6 +4,13 @@
+ 
+ enum kvm_page_track_mode {
+ 	KVM_PAGE_TRACK_WRITE,
++	KVM_PAGE_TRACK_ACCESS,
++	KVM_PAGE_TRACK_VIRTIO,
++	KVM_PAGE_TRACK_EXEC,
++	KVM_PAGE_TRACK_BOUNCE_BUFFER,
++	KVM_PAGE_TRACK_ENTER_NMI,
++	KVM_PAGE_TRACK_NMI_HANDLER,
++	KVM_PAGE_TRACK_DO_NMI,
+ 	KVM_PAGE_TRACK_MAX,
+ };
+ 
+diff --git a/arch/x86/kvm/Makefile b/arch/x86/kvm/Makefile
+index e553f0fdd87d..ce2bfbc37de6 100644
+--- a/arch/x86/kvm/Makefile
++++ b/arch/x86/kvm/Makefile
+@@ -11,7 +11,7 @@ kvm-$(CONFIG_KVM_ASYNC_PF)	+= $(KVM)/async_pf.o
+ 
+ kvm-y			+= x86.o emulate.o i8259.o irq.o lapic.o \
+ 			   i8254.o ioapic.o irq_comm.o cpuid.o pmu.o mtrr.o \
+-			   hyperv.o debugfs.o mmu/mmu.o mmu/page_track.o
++			   hyperv.o debugfs.o mmu/mmu.o mmu/page_track.o severed.o
+ 
+ kvm-intel-y		+= vmx/vmx.o vmx/vmenter.o vmx/pmu_intel.o vmx/vmcs12.o vmx/evmcs.o vmx/nested.o
+ kvm-amd-y		+= svm.o pmu_amd.o
+diff --git a/arch/x86/kvm/mmu.h b/arch/x86/kvm/mmu.h
+index a647601c9e1c..17fd9aed3820 100644
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -224,6 +224,10 @@ bool kvm_mmu_slot_gfn_write_protect(struct kvm *kvm,
+ 				    struct kvm_memory_slot *slot, u64 gfn);
+ int kvm_arch_write_log_dirty(struct kvm_vcpu *vcpu);
+ 
++bool kvm_mmu_slot_gfn_access_protect(struct kvm *kvm,
++                                   struct kvm_memory_slot *slot, u64 gfn);
++bool kvm_mmu_slot_gfn_exec_protect(struct kvm *kvm,
++                                   struct kvm_memory_slot *slot, u64 gfn);
+ int kvm_mmu_post_init_vm(struct kvm *kvm);
+ void kvm_mmu_pre_destroy_vm(struct kvm *kvm);
+ 
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 73dcfb290e32..edbb2822c3d7 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -48,6 +48,15 @@
+ #include <asm/kvm_page_track.h>
+ #include "trace.h"
+ 
++#include <linux/severed.h>
++#include <linux/severed_export.h>
++#include <linux/virtio_ring.h>
++
++extern spinlock_t tracking_lock;
++extern u64 packet_counter;
++extern u64 vm_mem_size;
++gfn_t last_virtio_gfn = 0;
++
+ extern bool itlb_multihit_kvm_mitigation;
+ 
+ static int __read_mostly nx_huge_pages = -1;
+@@ -856,6 +865,7 @@ static u64 mmu_spte_update_no_track(u64 *sptep, u64 new_spte)
+ 
+ 	WARN_ON(!is_shadow_present_pte(new_spte));
+ 
++
+ 	if (!is_shadow_present_pte(old_spte)) {
+ 		mmu_spte_set(sptep, new_spte);
+ 		return old_spte;
+@@ -1587,6 +1597,38 @@ static bool spte_write_protect(u64 *sptep, bool pt_protect)
+ 	return mmu_spte_update(sptep, spte);
+ }
+ 
++static bool spte_exec_protect(u64 *sptep, bool pt_protect)
++{
++	u64 spte = *sptep;
++
++	if (pt_protect)
++		spte &= ~SPTE_MMU_WRITEABLE;
++
++	// Have to do two steps here -> Thanks AMD for the NOT execute bit..
++	spte |= PT64_NX_MASK;
++
++	return mmu_spte_update(sptep, spte);
++}
++
++static bool spte_access_protect(u64 *sptep, bool pt_protect)
++{
++	u64 spte = *sptep;
++	int ret = false;
++
++	if (pt_protect)
++		spte &= ~SPTE_MMU_WRITEABLE;
++
++	spte = spte & ~PT_PRESENT_MASK;
++	// Have to do two steps here -> Thanks AMD for the NOT execute bit..
++
++	// Read and write tracking on AMD
++	spte &= ~PT_WRITABLE_MASK;
++
++	ret = mmu_spte_update(sptep, spte);
++
++	return ret;
++}
++
+ static bool __rmap_write_protect(struct kvm *kvm,
+ 				 struct kvm_rmap_head *rmap_head,
+ 				 bool pt_protect)
+@@ -1601,6 +1643,34 @@ static bool __rmap_write_protect(struct kvm *kvm,
+ 	return flush;
+ }
+ 
++static bool __rmap_exec_protect(struct kvm *kvm,
++				 struct kvm_rmap_head *rmap_head,
++				 bool pt_protect)
++{
++	u64 *sptep;
++	struct rmap_iterator iter;
++	bool flush = false;
++
++	for_each_rmap_spte(rmap_head, &iter, sptep)
++		flush |= spte_exec_protect(sptep, pt_protect);
++
++	return flush;
++}
++
++static bool __rmap_access_protect(struct kvm *kvm,
++				 struct kvm_rmap_head *rmap_head,
++				 bool pt_protect)
++{
++	u64 *sptep;
++	struct rmap_iterator iter;
++	bool flush = false;
++
++	for_each_rmap_spte(rmap_head, &iter, sptep)
++		flush |= spte_access_protect(sptep, pt_protect);
++
++	return flush;
++}
++
+ static bool spte_clear_dirty(u64 *sptep)
+ {
+ 	u64 spte = *sptep;
+@@ -1776,6 +1846,37 @@ bool kvm_mmu_slot_gfn_write_protect(struct kvm *kvm,
+ 	return write_protected;
+ }
+ 
++bool kvm_mmu_slot_gfn_exec_protect(struct kvm *kvm,
++				    struct kvm_memory_slot *slot, u64 gfn)
++{
++	struct kvm_rmap_head *rmap_head;
++	int i;
++	bool exec_protected = false;
++
++	for (i = PT_PAGE_TABLE_LEVEL; i <= PT_MAX_HUGEPAGE_LEVEL; ++i) {
++		rmap_head = __gfn_to_rmap(gfn, i, slot);
++		exec_protected |= __rmap_exec_protect(kvm, rmap_head, true);
++	}
++
++	return exec_protected;
++}
++
++bool kvm_mmu_slot_gfn_access_protect(struct kvm *kvm,
++				    struct kvm_memory_slot *slot, u64 gfn)
++{
++	struct kvm_rmap_head *rmap_head;
++	int i;
++	bool access_protected = false;
++
++
++	for (i = PT_PAGE_TABLE_LEVEL; i <= PT_MAX_HUGEPAGE_LEVEL; ++i) {
++		rmap_head = __gfn_to_rmap(gfn, i, slot);
++		access_protected |= __rmap_access_protect(kvm, rmap_head, true);
++	}
++
++	return access_protected;
++}
++
+ static bool rmap_write_protect(struct kvm_vcpu *vcpu, u64 gfn)
+ {
+ 	struct kvm_memory_slot *slot;
+@@ -3342,7 +3443,7 @@ static void disallowed_hugepage_adjust(struct kvm_shadow_walk_iterator it,
+ 	}
+ }
+ 
+-static int __direct_map(struct kvm_vcpu *vcpu, gpa_t gpa, int write,
++int __direct_map(struct kvm_vcpu *vcpu, gpa_t gpa, int write,
+ 			int map_writable, int max_level, kvm_pfn_t pfn,
+ 			bool prefault, bool account_disallowed_nx_lpage)
+ {
+@@ -4010,7 +4111,10 @@ static int handle_mmio_page_fault(struct kvm_vcpu *vcpu, u64 addr, bool direct)
+ 	bool reserved;
+ 
+ 	if (mmio_info_in_cache(vcpu, addr, direct))
++	{
++		walk_shadow_page_get_mmio_spte(vcpu, addr, &spte);
+ 		return RET_PF_EMULATE;
++	}
+ 
+ 	reserved = walk_shadow_page_get_mmio_spte(vcpu, addr, &spte);
+ 	if (WARN_ON(reserved))
+@@ -4038,12 +4142,128 @@ static int handle_mmio_page_fault(struct kvm_vcpu *vcpu, u64 addr, bool direct)
+ 	return RET_PF_RETRY;
+ }
+ 
++extern __virtio16 severed_last_event_idx;
+ static bool page_fault_handle_page_track(struct kvm_vcpu *vcpu,
+ 					 u32 error_code, gfn_t gfn)
+ {
++	struct kvm_memory_slot *slot;
++	int idx;
++	u64 iterator;
++	static int ctr = 0;
++	static int bb_access_ctr = 0;
++
+ 	if (unlikely(error_code & PFERR_RSVD_MASK))
+ 		return false;
+ 
++	if (kvm_page_track_is_active(vcpu, gfn, KVM_PAGE_TRACK_EXEC)) {
++		if ((error_code & PFERR_FETCH_MASK) && severed_action == SEVERED_INT_HANDLER_SEARCH_RUNNING) {
++			// Handler stored the faulting rip
++			kvm_severed_log("INT_HANDLER_SEARCH (%d) 0x%016llx;0x%016llx\n", ctr, gfn, last_saved_rip);
++			last_saved_rip = 0xdeadbeef;
++
++			// Increase counter -> Used to track multiple fetches for one execution
++			ctr++;
++
++			// Disable tracking of the current page
++			idx = srcu_read_lock(&vcpu->kvm->srcu);
++			slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
++			if (slot != NULL) {
++				spin_lock(&vcpu->kvm->mmu_lock);
++				{
++					kvm_slot_page_track_remove_page(vcpu->kvm, slot, gfn, KVM_PAGE_TRACK_EXEC);
++				}
++				spin_unlock(&vcpu->kvm->mmu_lock);
++			}
++			srcu_read_unlock(&vcpu->kvm->srcu, idx);
++
++			// Disable tracking for all pages
++			if (ctr >= 5) {
++				//Reset the counter to allow multiple executions of page/irq handler tracking
++				ctr = 0;
++				for (iterator = 0; iterator <= vm_mem_size; iterator++) {
++					idx = srcu_read_lock(&vcpu->kvm->srcu);
++					slot = kvm_vcpu_gfn_to_memslot(vcpu, iterator);
++					if (slot != NULL && kvm_page_track_is_active(vcpu, iterator, KVM_PAGE_TRACK_EXEC)) {
++						spin_lock(&vcpu->kvm->mmu_lock);
++						{
++							kvm_slot_page_track_remove_page(vcpu->kvm, slot, iterator, KVM_PAGE_TRACK_EXEC);
++						}
++						spin_unlock(&vcpu->kvm->mmu_lock);
++					}
++					srcu_read_unlock(&vcpu->kvm->srcu, idx);
++				}
++
++				spin_lock(&severed_action_lock);
++				severed_action = SEVERED_NONE;
++				spin_unlock(&severed_action_lock);
++			}
++
++			return false;
++		}
++	}
++
++
++	if (kvm_page_track_is_active(vcpu, gfn, KVM_PAGE_TRACK_VIRTIO) && severed_virtio_tracking_active) {
++		// Record the access to the virtio buffer pages
++		// We have to use the present bit for read tracking => Check if the
++		// present bit is CLEARED in the error code and the fetch and write
++		// bits are not set
++		severed_log_access(vcpu, error_code, gfn, KVM_PAGE_TRACK_VIRTIO);
++		printk("[DEBUG] Caught access on gfn 0x%llx, now starting write tracking... \n", gfn);
++
++		// Activate WRITE tracking for all RAM pages (except for the virtio
++		// buffer page itself)
++		kvm_start_tracking(vcpu, &gfn, KVM_PAGE_TRACK_BOUNCE_BUFFER);
++		bb_access_ctr = 0;
++
++		last_virtio_gfn = gfn;
++		return false;
++	}
++
++	if (kvm_page_track_is_active(vcpu, gfn, KVM_PAGE_TRACK_BOUNCE_BUFFER) && error_code & PFERR_WRITE_MASK) {
++		// If we want to read a packets contents, we could read here from the last gpa (from TRACK_VIRTIO)
++		// We set a conservative 1 here in case retrieving the flag fails!
++		__virtio16 flags = 1;
++		__virtio16 head = -1;
++		if (severed_input_vq != NULL) {
++			if (severed_get_avail_flags_hook && severed_get_avail_flags_hook(severed_input_vq, &flags, &head))
++				kvm_severed_log("[packet-%llu] current avail flag: %x, current head: %d\n", packet_counter, flags, head);
++			else
++				kvm_severed_log("[packet-%llu] could not read the avail flag\n", packet_counter);
++		}
++		kvm_severed_log("[packet-%llu] Caught a write access on gfn 0x%llx\n", packet_counter, gfn);
++
++		if (last_virtio_gfn != 0)
++			last_virtio_gfn = 0;
++
++		if (severed_virtio_tracking_active) {
++			bb_access_ctr++;
++			severed_log_access(vcpu, error_code, gfn, KVM_PAGE_TRACK_BOUNCE_BUFFER);
++		}
++
++		idx = srcu_read_lock(&vcpu->kvm->srcu);
++		slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
++		if (slot != NULL && kvm_page_track_is_active(vcpu, gfn, KVM_PAGE_TRACK_BOUNCE_BUFFER)) {
++			spin_lock(&vcpu->kvm->mmu_lock);
++			kvm_slot_page_track_remove_page(vcpu->kvm, slot, gfn, KVM_PAGE_TRACK_BOUNCE_BUFFER);
++			spin_unlock(&vcpu->kvm->mmu_lock);
++		}
++		srcu_read_unlock(&vcpu->kvm->srcu, idx);
++
++		if (head != severed_last_event_idx) {
++			// Stop BB tracking if 30 accesses were logged
++			kvm_stop_tracking(vcpu, KVM_PAGE_TRACK_BOUNCE_BUFFER);
++			kvm_severed_log("Recorded enough page writes for our packet. Count: %d\n", bb_access_ctr);
++			kvm_severed_log("ACTION_END\n");
++		}
++		return false;
++	}
++
++	if (kvm_page_track_is_active(vcpu, gfn, KVM_PAGE_TRACK_ACCESS)) {
++		severed_log_access(vcpu, error_code, gfn, KVM_PAGE_TRACK_ACCESS);
++		return false;
++	}
++
+ 	if (!(error_code & PFERR_PRESENT_MASK) ||
+ 	      !(error_code & PFERR_WRITE_MASK))
+ 		return false;
+@@ -4053,7 +4273,7 @@ static bool page_fault_handle_page_track(struct kvm_vcpu *vcpu,
+ 	 * not be fixed by page fault handler.
+ 	 */
+ 	if (kvm_page_track_is_active(vcpu, gfn, KVM_PAGE_TRACK_WRITE))
+-		return true;
++		return false;
+ 
+ 	return false;
+ }
+diff --git a/arch/x86/kvm/mmu/page_track.c b/arch/x86/kvm/mmu/page_track.c
+index 3521e2d176f2..e9fe245af738 100644
+--- a/arch/x86/kvm/mmu/page_track.c
++++ b/arch/x86/kvm/mmu/page_track.c
+@@ -91,6 +91,7 @@ void kvm_slot_page_track_add_page(struct kvm *kvm,
+ 				  struct kvm_memory_slot *slot, gfn_t gfn,
+ 				  enum kvm_page_track_mode mode)
+ {
++	int tlb_flush = 0;
+ 
+ 	if (WARN_ON(!page_track_mode_is_valid(mode)))
+ 		return;
+@@ -103,9 +104,28 @@ void kvm_slot_page_track_add_page(struct kvm *kvm,
+ 	 */
+ 	kvm_mmu_gfn_disallow_lpage(slot, gfn);
+ 
+-	if (mode == KVM_PAGE_TRACK_WRITE)
+-		if (kvm_mmu_slot_gfn_write_protect(kvm, slot, gfn))
+-			kvm_flush_remote_tlbs(kvm);
++	switch (mode) {
++		case KVM_PAGE_TRACK_WRITE:
++		case KVM_PAGE_TRACK_BOUNCE_BUFFER:
++			tlb_flush = kvm_mmu_slot_gfn_write_protect(kvm, slot, gfn);
++			break;
++		case KVM_PAGE_TRACK_ACCESS:
++		case KVM_PAGE_TRACK_VIRTIO:
++			tlb_flush = kvm_mmu_slot_gfn_access_protect(kvm, slot, gfn);
++			break;
++		case KVM_PAGE_TRACK_NMI_HANDLER:
++		case KVM_PAGE_TRACK_EXEC:
++		case KVM_PAGE_TRACK_ENTER_NMI:
++		case KVM_PAGE_TRACK_DO_NMI:
++			tlb_flush = kvm_mmu_slot_gfn_exec_protect(kvm, slot, gfn);
++			break;
++		default:
++			// Do nothing
++			tlb_flush = 0;
++	}
++
++	if(tlb_flush)
++		kvm_flush_remote_tlbs(kvm);
+ }
+ EXPORT_SYMBOL_GPL(kvm_slot_page_track_add_page);
+ 
+diff --git a/arch/x86/kvm/severed.c b/arch/x86/kvm/severed.c
+new file mode 100644
+index 000000000000..b6b78de5eb90
+--- /dev/null
++++ b/arch/x86/kvm/severed.c
+@@ -0,0 +1,599 @@
++#include <linux/severed.h>
++#include <linux/severed_export.h>
++
++#include <linux/kvm.h>
++#include <linux/kvm_host.h>
++
++#include <linux/ktime.h>
++#include <linux/types.h>
++
++#include <linux/vhost.h>
++
++DEFINE_SPINLOCK(tracking_lock);
++DEFINE_SPINLOCK(severed_virtio_lock);
++
++struct kvm *last_created_vm;
++
++extern spinlock_t severed_action_lock;
++extern int severed_action;
++extern mapping_change_param_t severed_change_param;
++extern mapping_change_param2_t severed_gfn_to_pfn_map;
++extern ktime_t severed_stop_time;
++
++u64 vm_mem_size = 0;
++EXPORT_SYMBOL(vm_mem_size);
++
++access_t *access_buffer_curr = NULL;
++access_t *access_buffer = NULL;
++bool access_buffer_overflow = false;
++void *severed_input_vq = NULL;
++__virtio16 severed_last_event_idx = -1;
++
++struct kvm_vcpu *severed_last_vcpu = NULL;
++EXPORT_SYMBOL(severed_last_vcpu);
++
++int (*severed_get_avail_flags_hook)(void *_vq, __virtio16 *flags, __virtio16 *head) = NULL;
++EXPORT_SYMBOL(severed_get_avail_flags_hook);
++
++u64 last_error_code = 0;
++
++u64 last = 0;
++
++u64 translate_gfn = 0;
++
++int severed_virtio_tracking_active = 0;
++EXPORT_SYMBOL(severed_virtio_tracking_active);
++
++virtio_track_t *virtio_pages_buf_curr = NULL;
++virtio_track_t *virtio_pages_buf_new = NULL;
++virtio_track_t *virtio_pages_buf = NULL;
++
++unsigned access_identifier = 0;
++
++u64 packet_counter = 0;
++bool packet_has_payload = false;
++
++static void kvm_output_page_tracking(struct kvm_vcpu *vcpu, access_t *pos);
++static long __start_tracking(struct kvm_vcpu *vcpu, u64 gfn,
++				enum kvm_page_track_mode mode);
++
++long severed_translate_gpa(struct kvm_vcpu *vcpu)
++{
++	u64 pfn = gfn_to_pfn(vcpu->kvm, translate_gfn);
++	kvm_severed_log("GFN: 0x%llx = PFN: 0x%llx\n", translate_gfn, pfn);
++	return 0;
++}
++EXPORT_SYMBOL(severed_translate_gpa);
++
++unsigned kvm_get_access_identifier(void)
++{
++	return access_identifier;
++}
++EXPORT_SYMBOL(kvm_get_access_identifier);
++
++int severed_log_access(struct kvm_vcpu *vcpu, u32 error_code,
++			gfn_t gfn, enum kvm_page_track_mode mode)
++{
++	struct kvm_memory_slot *slot = NULL;
++	int idx;
++	int ret = 0;
++
++	if (access_buffer_curr == NULL){
++		kvm_severed_log("Access buffer not initialized!\n");
++		return -1;
++	}
++
++	spin_lock(&tracking_lock);
++	{
++		// Store access in ring buffer
++		access_buffer_curr->time = ktime_get();
++		access_buffer_curr->gfn = gfn;
++
++		// Global variables
++		access_buffer_curr->gva = last_saved_rip;
++		access_buffer_curr->gpa = last_gpa;
++		access_buffer_curr->error_code = error_code;
++		last_saved_rip = 0xdeadbeef;
++
++		// Detect ring buffer overflows
++		if (unlikely(access_buffer_curr >= (access_buffer + MAX_SEV_BUF_SIZE - 1))) {
++			kvm_severed_log("Attention, ring buffer overflow!\n");
++			access_buffer_overflow = true;
++			severed_stop_time = ktime_get();
++			severed_print_access_buf(vcpu);
++		} else {
++			access_buffer_curr += 1;
++		}
++
++		// Disable tracking for this page -> Sanity check if mode is active
++		if (kvm_page_track_is_active(vcpu, gfn, mode)) {
++			idx = srcu_read_lock(&vcpu->kvm->srcu);
++			slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
++
++			 // RAM area?
++			if (slot != NULL) {
++				spin_lock(&vcpu->kvm->mmu_lock);
++				{
++					kvm_slot_page_track_remove_page(vcpu->kvm, slot, gfn, mode);
++				}
++				spin_unlock(&vcpu->kvm->mmu_lock);
++			} else {
++				kvm_severed_log("Attention, No memory slot found for gfn 0x%016llx\n", gfn);
++			}
++			srcu_read_unlock(&vcpu->kvm->srcu, idx);
++			ret = 0;
++		} else {
++			ret = -1;
++		}
++	}
++	spin_unlock(&tracking_lock);
++	return ret;
++}
++EXPORT_SYMBOL(severed_log_access);
++
++long set_virtio_tracking()
++{
++	void *tmp = kmalloc(sizeof(virtio_track_t) * 0x100, GFP_KERNEL);
++	if (!tmp) {
++		//This should not happen
++		kvm_severed_log("Allocation of virtio pages buffer failed!\n");
++		return -1;
++	}
++
++	init_access_buffer();
++
++	spin_lock(&severed_virtio_lock);
++	if (severed_virtio_tracking_active != 0) {
++		// Reset if tracking is turned on (again)
++		if (!virtio_pages_buf) {
++			virtio_pages_buf = tmp;
++		} else {
++			kfree(tmp);
++		}
++		virtio_pages_buf_curr = virtio_pages_buf;
++		virtio_pages_buf_new = virtio_pages_buf;
++	} else {
++		kfree(tmp);
++		// Deactivate
++		spin_lock(&severed_action_lock);
++		severed_action = SEVERED_STOPTR;
++		spin_unlock(&severed_action_lock);
++		// TODO: Reset access rights for all pages here
++	}
++
++	printk(KERN_INFO "[DEBUG] please flush\n");
++	kvm_severed_log("set_virtio_tracking (%d): ACTION_END\n", severed_virtio_tracking_active);
++
++	spin_unlock(&severed_virtio_lock);
++
++	spin_lock(&severed_action_lock);
++	severed_action = SEVERED_FLUSH_TLBS;
++	spin_unlock(&severed_action_lock);
++	return 0;
++}
++EXPORT_SYMBOL(set_virtio_tracking);
++
++int init_access_buffer(void)
++{
++	void *tmp = kmalloc(sizeof(access_t)*MAX_SEV_BUF_SIZE, GFP_KERNEL);
++	if (!tmp) {
++		//This should not happen
++		kvm_severed_log("Allocation of tracking buffer failed. Exiting!\n");
++		return -1;
++	}
++	spin_lock(&tracking_lock);
++	if (access_buffer == NULL) {
++		access_buffer = tmp;
++		access_buffer_overflow = false;
++		access_buffer_curr = access_buffer;
++		printk("[ACCESS_BUF] Reset\n");
++	} else {
++		kfree(tmp);
++	}
++	spin_unlock(&tracking_lock);
++
++	return 0;
++}
++
++long kvm_start_find_int_handler(struct kvm_vcpu *vcpu)
++{
++	long count = 0;
++	u64 iterator;
++
++	// Remove execute permission for every guest page
++	for (iterator=0; iterator <= vm_mem_size; iterator++) {
++		severed_start_tracking(vcpu, iterator, KVM_PAGE_TRACK_EXEC, true);
++		count++;
++	}
++
++	return count;
++}
++EXPORT_SYMBOL(kvm_start_find_int_handler);
++
++long severed_start_tracking(struct kvm_vcpu *vcpu, u64 gfn, enum kvm_page_track_mode mode, int mmu_lock_acquire)
++{
++	long ret;
++
++	if (mmu_lock_acquire)
++		spin_lock(&vcpu->kvm->mmu_lock);
++
++	ret = __start_tracking(vcpu, gfn, mode);
++
++	if (mmu_lock_acquire)
++		spin_unlock(&vcpu->kvm->mmu_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL(severed_start_tracking);
++
++static long __start_tracking(struct kvm_vcpu *vcpu, u64 gfn, enum kvm_page_track_mode mode)
++{
++	struct kvm_memory_slot *slot;
++	int idx;
++	long ret;
++
++	// Caller is responsible for acquireing the MMU lock before calling the fct
++	idx = srcu_read_lock(&vcpu->kvm->srcu);
++	slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
++	if (slot != NULL && !kvm_page_track_is_active(vcpu, gfn, mode)) {
++		kvm_slot_page_track_add_page(vcpu->kvm, slot, gfn, mode);
++		ret = 0;
++	} else {
++		ret = -1;
++	}
++
++	srcu_read_unlock(&vcpu->kvm->srcu, idx);
++	return ret;
++}
++
++long kvm_start_tracking(struct kvm_vcpu *vcpu, u64 *except, enum kvm_page_track_mode mode)
++{
++	long count = 0;
++	u64 iterator;
++	struct kvm_memory_slot *slot;
++	int idx;
++
++	init_access_buffer();
++	spin_lock(&vcpu->kvm->mmu_lock);
++	 // NOTE: vm_mem_size is for now statically defined in svm.c:5469, might need to be adapted 
++	for (iterator=0; iterator <= vm_mem_size; iterator++) {
++		if (except != NULL && iterator == *except)
++			continue;
++
++		idx = srcu_read_lock(&vcpu->kvm->srcu);
++		slot = kvm_vcpu_gfn_to_memslot(vcpu, iterator);
++		if (slot != NULL  && !kvm_page_track_is_active(vcpu, iterator, mode)) {
++			kvm_slot_page_track_add_page(vcpu->kvm, slot, iterator, mode);
++			count++;
++		}
++		srcu_read_unlock(&vcpu->kvm->srcu, idx);
++	}
++	spin_unlock(&vcpu->kvm->mmu_lock);
++
++	kvm_flush_remote_tlbs(vcpu->kvm);
++	return count;
++}
++EXPORT_SYMBOL(kvm_start_tracking);
++
++long kvm_start_tracking_virtio_pages(struct kvm_vcpu *vcpu, int only_new)
++{
++	virtio_track_t *it = NULL;
++	struct kvm_memory_slot *slot;
++	int idx;
++	u64 page;
++	int r = 0;
++
++	spin_lock(&severed_virtio_lock);
++	it = (only_new == 1 ? virtio_pages_buf_new : virtio_pages_buf);
++	for (; it != NULL && it != virtio_pages_buf_curr; it++) {
++		page = it->gpa >> PAGE_SHIFT;
++		kvm_severed_log("[packet-%llu] Removing rights for page: 0x%llx\n", packet_counter, page);
++
++		idx = srcu_read_lock(&vcpu->kvm->srcu);
++		slot = kvm_vcpu_gfn_to_memslot(vcpu, page);
++		if (slot == NULL) {
++			// This should be RAM (not IO memory) => A slot should be available
++			kvm_severed_log("Could not find slot!\n");
++			srcu_read_unlock(&vcpu->kvm->srcu, idx);
++			r = -1;
++			goto out;
++		} else {
++			spin_lock(&vcpu->kvm->mmu_lock);
++			kvm_slot_page_track_add_page(vcpu->kvm, slot, page, KVM_PAGE_TRACK_VIRTIO);
++			spin_unlock(&vcpu->kvm->mmu_lock);
++		}
++		srcu_read_unlock(&vcpu->kvm->srcu, idx);
++	}
++
++	kvm_flush_remote_tlbs(vcpu->kvm);
++	kvm_make_request(KVM_REQ_TLB_FLUSH, vcpu);
++
++	out:
++	virtio_pages_buf_new = virtio_pages_buf_curr;
++	spin_unlock(&severed_virtio_lock);
++	return r;
++}
++EXPORT_SYMBOL(kvm_start_tracking_virtio_pages);
++
++long add_virtio_track_gpa(u64 gpa, void __user *iov_base, int vq_index, void *vq)
++{
++
++	__virtio16 flags;
++	__virtio16 head;
++
++	if (!severed_virtio_tracking_active || virtio_pages_buf == NULL)
++		return -1;
++
++	if (severed_virtio_tracking_active) {
++		spin_lock(&severed_virtio_lock);
++
++		virtio_pages_buf_curr->gpa = gpa;
++		virtio_pages_buf_curr++;
++		packet_counter++;
++
++		spin_unlock(&severed_virtio_lock);
++
++		if (severed_last_vcpu != NULL) {
++			kvm_severed_log("[packet-%llu][VIRTIO] Activate tracking for GPA: 0x%llx\n", packet_counter, gpa);
++			severed_input_vq = vq;
++			if (severed_get_avail_flags_hook && severed_get_avail_flags_hook(vq, &flags, &head)) {
++				kvm_severed_log("[packet-%llu][VIRTIO] available flag: 0x%x. head: %d\n", packet_counter, flags, head);
++				severed_last_event_idx = head;
++			} else {
++				kvm_severed_log("[packet-%llu][VIRTIO] failed to get available flag\n", packet_counter);
++			}
++
++			kvm_start_tracking_virtio_pages(severed_last_vcpu, 1);
++			++severed_last_vcpu->stat.tlb_flush;
++			kvm_x86_ops->tlb_flush(severed_last_vcpu, true);
++		} else {
++			kvm_severed_log("[packet-%llu][VIRTIO] severed_last_vcpu is NULL, stopping... \n", packet_counter);
++		}
++		spin_lock(&severed_action_lock);
++		severed_action = SEVERED_FLUSH_TLBS;
++		spin_unlock(&severed_action_lock);
++		return 0;
++	}
++	return -1;
++}
++EXPORT_SYMBOL(add_virtio_track_gpa);
++
++void severed_print_access_buf(struct kvm_vcpu *vcpu)
++{
++	access_t *it = NULL;
++	int comma_separator = 1000000000;
++
++	if (access_buffer == NULL || access_buffer_curr == NULL)
++		return;
++
++	// Print the time when tracking was stopped.
++	// Required to calculate time offset of memory accesses in evaluation
++	kvm_severed_log(
++		"Basetime:%lld.%09lld\n",
++		severed_stop_time / comma_separator,
++		severed_stop_time % comma_separator
++	);
++
++	// If ring buffer is full, start with the first tracked page
++	// We are overwriting entries -> Next value that would be overwritten
++	//  is the first tracked one in the buffer
++	if (access_buffer_overflow) {
++		for (it = access_buffer_curr; it < access_buffer + MAX_SEV_BUF_SIZE; it++)
++			kvm_output_page_tracking(vcpu, it);
++	}
++
++	// Print the values from the start of the access buffer
++	for (it = access_buffer; it < access_buffer_curr; it++)
++		kvm_output_page_tracking(vcpu, it);
++
++	// Reset the curr pointer
++	access_buffer_curr = access_buffer;
++}
++EXPORT_SYMBOL(severed_print_access_buf);
++
++long kvm_stop_tracking(struct kvm_vcpu *vcpu, enum kvm_page_track_mode mode)
++{
++	long count = 0;
++	u64 iterator;
++	struct kvm_memory_slot *slot;
++	int idx;
++
++	kvm_severed_log("Stopping tracking for packet #%llu\n", packet_counter);
++	for (iterator = 0; iterator <= vm_mem_size; iterator++) {
++		idx = srcu_read_lock(&vcpu->kvm->srcu);
++		slot = kvm_vcpu_gfn_to_memslot(vcpu, iterator);
++		if (slot != NULL  && kvm_page_track_is_active(vcpu, iterator, mode)) {
++			spin_lock(&vcpu->kvm->mmu_lock);
++			kvm_slot_page_track_remove_page(vcpu->kvm, slot, iterator, mode);
++			spin_unlock(&vcpu->kvm->mmu_lock);
++			count++;
++		}
++		srcu_read_unlock(&vcpu->kvm->srcu, idx);
++	}
++
++	if (access_buffer == NULL) {
++		kvm_severed_log("Tracking has not been started yet, stopping.\n");
++		return -2;
++	}
++	return count;
++}
++EXPORT_SYMBOL(kvm_stop_tracking);
++
++static void kvm_output_page_tracking(struct kvm_vcpu *vcpu, access_t *pos)
++{
++	int comma_separator = 1000000000;
++	kvm_pfn_t pfn;
++
++	pfn = gfn_to_pfn(vcpu->kvm, pos->gfn);
++	kvm_severed_log(
++		"0x%016llx:0x%016llx:0x%016llx:0x%02x:%lld.%09lld:0x%016llx\n",
++		pos->gfn,
++		pos->gva,
++		pos->gpa,
++		pos->error_code,
++		pos->time/comma_separator,
++		pos->time%comma_separator,
++		pfn
++	);
++	pos->gfn = 0;
++	pos->error_code = 0;
++	pos->time = 0;
++}
++
++long kvm_change_mapping(struct kvm_vcpu *vcpu)
++{
++	int ret = 1;
++	kvm_pfn_t pfn1, pfn2, pfn_after_remap;
++	gfn_t gfn1, gfn2;
++	int level = 1;
++
++	gfn1 = severed_change_param.gfn1;
++	gfn2 = severed_change_param.gfn2;
++
++	spin_lock(&vcpu->kvm->mmu_lock);
++
++	pfn1 = gfn_to_pfn(vcpu->kvm, gfn1);
++	pfn2 = gfn_to_pfn(vcpu->kvm, gfn2);
++	kvm_severed_log("Change mapping of 0x%llx (PFN: 0x%llx) and 0x%llx (PFN: 0x%llx)\n", gfn1, pfn1, gfn2, pfn2);
++
++	//Error codes, see kvm_host.h
++	if ((pfn1 & KVM_PFN_ERR_MASK) || (pfn1 & KVM_PFN_ERR_NOSLOT_MASK)) {
++		kvm_severed_log("gfn_to_pfn returned an invalid return value: 0x%llx\n", pfn1);
++		ret = -4;
++		goto return_from_func;
++	}
++
++	if (pfn1 > MAX_HOST_MEMORY) {
++		kvm_severed_log("pfn out of memory bound. pfn2: 0x%llx\n", pfn1);
++		ret = -5;
++		goto return_from_func;
++	}
++
++	if ((pfn2 & KVM_PFN_ERR_MASK) || (pfn2 & KVM_PFN_ERR_NOSLOT_MASK)) {
++		kvm_severed_log("gfn_to_pfn returned an invalid return value: 0x%llx\n", pfn2);
++		ret = -4;
++		goto return_from_func;
++	}
++
++	if (pfn2 > MAX_HOST_MEMORY) {
++		kvm_severed_log("pfn out of memory bound. pfn2: 0x%llx\n", pfn2);
++		ret = -5;
++		goto return_from_func;
++	}
++
++	if (gfn1 != 0 && gfn2 != 0 && !(pfn1 & KVM_PFN_NOSLOT) && !(pfn2 & KVM_PFN_NOSLOT)) {
++
++		ret = __direct_map(
++			vcpu,
++			gfn2 << 12,
++			1,
++			1, // map writeable
++			level,
++			pfn1,
++			0,
++			false
++		);
++
++		pfn_after_remap = gfn_to_pfn_atomic(vcpu->kvm, gfn2);
++		ret = 1;
++	} else {
++		ret = -1;
++		kvm_severed_log("In %s, no valid mapping found for GFN 0x%llx (PFN: 0x%llx)\n", __func__, gfn2, pfn2);
++	}
++
++
++	return_from_func:
++	spin_unlock(&vcpu->kvm->mmu_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL(kvm_change_mapping);
++
++
++long severed_map_gfn_to_pfn(struct kvm_vcpu *vcpu)
++{
++	int ret;
++	int level = 1;
++	u64 gfn = 0, pfn = 0;
++
++	gfn = severed_gfn_to_pfn_map.gfn;
++	pfn = severed_gfn_to_pfn_map.pfn;
++
++	kvm_severed_log("Changing mapping of GFN 0x%llx to PFN 0x%llx\n", gfn, pfn);
++
++	if (pfn > MAX_HOST_MEMORY) {
++		kvm_severed_log("PFN 0x%llx out of memory bound\n", pfn);
++		return -5;
++	}
++
++	if (gfn != 0 && pfn != 0 && !(pfn & KVM_PFN_NOSLOT)) {
++		spin_lock(&vcpu->kvm->mmu_lock);
++		ret = __direct_map(
++			vcpu,
++			gfn << 12,
++			0,
++			0, // map writeable
++			level,
++			pfn,
++			0,
++			false
++		);
++		spin_unlock(&vcpu->kvm->mmu_lock);
++
++		//TLB needs to be flushed, calling function is responsible
++		return 1;
++	} else {
++		//Inform user space that remapping failed
++		kvm_severed_log("In %s, no valid mapping found for gfn 0x%llx (pfn: 0x%llx)\n", __func__, gfn, pfn);
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL(severed_map_gfn_to_pfn);
++
++void set_error_code(u64 error_code)
++{
++	last_error_code = error_code;
++}
++EXPORT_SYMBOL(set_error_code);
++
++void severed_add_pid(pid_t* severed_vm_pids, pid_t new_pid)
++{
++	int i;
++	for (i = 0;i < SEVERED_MAX_VMS; i++) {
++		if (severed_vm_pids[i] == 0) {
++			severed_vm_pids[i] = new_pid;
++			kvm_severed_log("PID %u is now being tracked\n", severed_vm_pids[i]);
++			return;
++		}
++	}
++		kvm_severed_log("No space for more PIDS\n");
++}
++EXPORT_SYMBOL(severed_add_pid);
++
++void severed_remove_pid(pid_t* severed_vm_pids, pid_t pid)
++{
++	int i;
++	for (i = 0;i < SEVERED_MAX_VMS; i++) {
++		if (severed_vm_pids[i] == pid) {
++			kvm_severed_log("Stopped tracking PID %u\n", severed_vm_pids[i]);
++			severed_vm_pids[i] = 0;
++			return;
++		}
++	}
++	kvm_severed_log("PID was not being tracked\n");
++}
++EXPORT_SYMBOL(severed_remove_pid);
++
++bool severed_tracked_pid(pid_t* severed_vm_pids, pid_t pid)
++{
++	int i;
++	for (i = 0;i < SEVERED_MAX_VMS; i++) {
++		if (severed_vm_pids[i] == pid) {
++			return true;
++		}
++	}
++	kvm_severed_log("PID is not being tracked\n");
++	return false;
++}
++EXPORT_SYMBOL(severed_tracked_pid);
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index d71f440ec8a6..8a18797863f2 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -55,6 +55,8 @@
+ #include <asm/virtext.h>
+ #include "trace.h"
+ 
++#include <linux/severed.h>
++
+ #define __ex(x) __kvm_handle_fault_on_reboot(x)
+ 
+ MODULE_AUTHOR("Qumranet");
+@@ -119,6 +121,12 @@ MODULE_DEVICE_TABLE(x86cpu, svm_cpu_id);
+ #define AVIC_GATAG_TO_VMID(x)		((x >> AVIC_VCPU_ID_BITS) & AVIC_VM_ID_MASK)
+ #define AVIC_GATAG_TO_VCPUID(x)		(x & AVIC_VCPU_ID_MASK)
+ 
++extern int severed_action;
++extern int severed_pid_from_shell;
++extern uint access_identifier;
++extern bool hit_nmi_entry_point;
++extern u64 vm_mem_size;
++
+ static bool erratum_383_found __read_mostly;
+ 
+ struct kvm_vcpu;
+@@ -274,8 +282,10 @@ module_param(dump_invalid_vmcb, bool, 0644);
+ 
+ static u8 rsm_ins_bytes[] = "\x0f\xaa";
+ 
++static inline void svm_inject_irq(struct vcpu_svm *svm, int irq);
++
+ static void svm_set_cr0(struct kvm_vcpu *vcpu, unsigned long cr0);
+-static void svm_flush_tlb(struct kvm_vcpu *vcpu, bool invalidate_gpa);
++void svm_flush_tlb(struct kvm_vcpu *vcpu, bool invalidate_gpa);
+ static void svm_complete_interrupts(struct vcpu_svm *svm);
+ static void svm_toggle_avic_for_irq_window(struct kvm_vcpu *vcpu, bool activate);
+ static inline void avic_post_state_restore(struct kvm_vcpu *vcpu);
+@@ -2828,7 +2838,10 @@ static int npf_interception(struct vcpu_svm *svm)
+ {
+ 	u64 fault_address = __sme_clr(svm->vmcb->control.exit_info_2);
+ 	u64 error_code = svm->vmcb->control.exit_info_1;
++	last_saved_rip = svm->vmcb->save.rip;
++	last_gpa = svm->vmcb->control.exit_info_2;
+ 
++	set_error_code(error_code);
+ 	trace_kvm_page_fault(fault_address, error_code);
+ 	return kvm_mmu_page_fault(&svm->vcpu, fault_address, error_code,
+ 			static_cpu_has(X86_FEATURE_DECODEASSISTS) ?
+@@ -5431,7 +5444,113 @@ static int handle_exit(struct kvm_vcpu *vcpu,
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+ 	struct kvm_run *kvm_run = vcpu->run;
++	gva_t syscall_rip_gva = svm->vmcb->save.sysenter_eip;
++	gpa_t syscall_rip_gpa = vcpu->arch.walk_mmu->gva_to_gpa(vcpu, syscall_rip_gva, PFERR_USER_MASK, NULL);
+ 	u32 exit_code = svm->vmcb->control.exit_code;
++	//long severed_retval, i;
++	long severed_retval;
++
++	pid_t  severed_vm_pid = vcpu -> kvm -> userspace_pid;
++
++	last_saved_rip = svm->vmcb->save.rip;
++	last_gpa = svm->vmcb->control.exit_info_2;
++
++
++	spin_lock(&severed_action_lock);
++	severed_last_vcpu = vcpu;
++	spin_unlock(&severed_action_lock);
++
++
++	//Calculate the VM memory dynamically
++	//TODO: causes a soft lockup
++	/*for (i = 0; i < vcpu->kvm->memslots[0]->used_slots; i++) {
++		vm_mem_size += vcpu->kvm->memslots[0]->memslots[i].npages;
++	}*/
++	vm_mem_size = 0x7FFFF;
++
++	spin_lock(&severed_action_lock);
++	switch (severed_action) {
++	case SEVERED_NONE:
++		break;
++	case SEVERED_PRINT:
++		severed_print_access_buf(vcpu);
++		severed_action = SEVERED_NONE;
++		kvm_severed_log("severed_print: ACTION_END\n");
++		break;
++	case SEVERED_ISSUE_NMI:
++		if (severed_vm_pid == severed_pid_from_shell) {
++			kvm_severed_log("Sending NMI to guest at PID: %u\n", severed_vm_pid);
++			kvm_inject_nmi(vcpu);
++			severed_action = SEVERED_NONE;
++		}
++		break;
++	case SEVERED_FIND_INT_HANDLER:
++		if (severed_vm_pid == severed_pid_from_shell) {
++			kvm_severed_log("Start to find interrupt handler | IRQ: %d\n", severed_irq_no.irq_no);
++			severed_retval = kvm_start_find_int_handler(vcpu);
++			severed_action = SEVERED_INT_HANDLER_SEARCH_RUNNING;
++
++			// Inject an interrupt into the VM -> interrupt handler will be executed
++			// and we are able to record the GFN of the handler
++			if (severed_irq_no.irq_no < 0) {
++				kvm_inject_nmi(vcpu);
++			} else {
++				vcpu->arch.interrupt.nr = severed_irq_no.irq_no;
++				kvm_x86_ops->set_nmi(vcpu);
++			}
++		}
++		break;
++	case SEVERED_STARTTR:
++		if (severed_vm_pid == severed_pid_from_shell) {
++			kvm_severed_log("Syscall_rip: 0x%016lx;0x%016llx\n", syscall_rip_gva, syscall_rip_gpa);
++			severed_retval = kvm_start_tracking(vcpu, NULL, KVM_PAGE_TRACK_ACCESS);
++			severed_action = SEVERED_NONE;
++			// Flush guest tlbs
++			svm->vmcb->control.tlb_ctl = 0x01;
++			mark_dirty(svm->vmcb, VMCB_ASID);
++		}
++		break;
++	case SEVERED_STOPTR:
++		if (severed_vm_pid == severed_pid_from_shell) {
++			severed_retval = kvm_stop_tracking(vcpu, KVM_PAGE_TRACK_ACCESS);
++			severed_action = SEVERED_NONE;
++			kvm_severed_log("Current tlb_ctl: %d\n", svm->vmcb->control.tlb_ctl);
++			svm->vmcb->control.tlb_ctl = 0x01;
++			mark_dirty(svm->vmcb, VMCB_ASID);
++			kvm_severed_log("Current tlb_ctl after: %d\n", svm->vmcb->control.tlb_ctl);
++		}
++		break;
++	case SEVERED_CHGMP_DIR:
++		{
++		if (severed_vm_pid == severed_pid_from_shell) {
++			severed_retval = severed_map_gfn_to_pfn(vcpu);
++			if (severed_retval == 1)
++				svm_flush_tlb(vcpu, true);
++			severed_action = SEVERED_NONE;
++		}
++		}
++		break;
++	case SEVERED_CHGMP:
++		if (severed_vm_pid == severed_pid_from_shell) {
++			severed_retval = kvm_change_mapping(vcpu);
++			severed_action = SEVERED_NONE;
++		}
++		break;
++	case SEVERED_GET_PFN:
++		if (severed_vm_pid == severed_pid_from_shell) {
++			severed_retval = severed_translate_gpa(vcpu);
++			severed_action = SEVERED_NONE;
++		}
++		break;
++	case SEVERED_FLUSH_TLBS:
++		printk("[DEBUG] Flush TLBs!\n");
++		svm_flush_tlb(vcpu, true);
++		svm->vmcb->control.tlb_ctl = 0x01;
++		mark_dirty(svm->vmcb, VMCB_ASID);
++		__flush_tlb_all();
++		severed_action = SEVERED_NONE;
++	}
++	spin_unlock(&severed_action_lock);
+ 
+ 	trace_kvm_exit(exit_code, vcpu, KVM_ISA_SVM);
+ 
+@@ -6094,7 +6213,7 @@ static int svm_set_identity_map_addr(struct kvm *kvm, u64 ident_addr)
+ 	return 0;
+ }
+ 
+-static void svm_flush_tlb(struct kvm_vcpu *vcpu, bool invalidate_gpa)
++void svm_flush_tlb(struct kvm_vcpu *vcpu, bool invalidate_gpa)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+ 
+@@ -6103,6 +6222,7 @@ static void svm_flush_tlb(struct kvm_vcpu *vcpu, bool invalidate_gpa)
+ 	else
+ 		svm->asid_generation--;
+ }
++EXPORT_SYMBOL(svm_flush_tlb);
+ 
+ static void svm_flush_tlb_gva(struct kvm_vcpu *vcpu, gva_t gva)
+ {
+diff --git a/drivers/vhost/vhost.c b/drivers/vhost/vhost.c
+index f44340b41494..fc88a4f21a5e 100644
+--- a/drivers/vhost/vhost.c
++++ b/drivers/vhost/vhost.c
+@@ -31,6 +31,7 @@
+ #include <linux/interval_tree_generic.h>
+ #include <linux/nospec.h>
+ #include <linux/kcov.h>
++#include <linux/severed_export.h>
+ 
+ #include "vhost.h"
+ 
+@@ -253,6 +254,8 @@ void vhost_poll_flush(struct vhost_poll *poll)
+ }
+ EXPORT_SYMBOL_GPL(vhost_poll_flush);
+ 
++bool show_stack_trace_for_vhost_work_queue = false;
++EXPORT_SYMBOL_GPL(show_stack_trace_for_vhost_work_queue);
+ void vhost_work_queue(struct vhost_dev *dev, struct vhost_work *work)
+ {
+ 	if (!dev->worker)
+@@ -263,6 +266,11 @@ void vhost_work_queue(struct vhost_dev *dev, struct vhost_work *work)
+ 		 * sure it was not in the list.
+ 		 * test_and_set_bit() implies a memory barrier.
+ 		 */
++		if (show_stack_trace_for_vhost_work_queue) {
++			printk("TRACING: start vhost_work_queue stack\n");
++			dump_stack();
++			printk("TRACING: end vhost_work_queue stack\n");
++		}
+ 		llist_add(&work->node, &dev->work_list);
+ 		wake_up_process(dev->worker);
+ 	}
+@@ -780,7 +788,7 @@ static bool memory_access_ok(struct vhost_dev *d, struct vhost_umem *umem,
+ }
+ 
+ static int translate_desc(struct vhost_virtqueue *vq, u64 addr, u32 len,
+-			  struct iovec iov[], int iov_size, int access);
++			  struct iovec iov[], int iov_size, int access, bool track);
+ 
+ static int vhost_copy_to_user(struct vhost_virtqueue *vq, void __user *to,
+ 			      const void *from, unsigned size)
+@@ -805,7 +813,7 @@ static int vhost_copy_to_user(struct vhost_virtqueue *vq, void __user *to,
+ 
+ 		ret = translate_desc(vq, (u64)(uintptr_t)to, size, vq->iotlb_iov,
+ 				     ARRAY_SIZE(vq->iotlb_iov),
+-				     VHOST_ACCESS_WO);
++				     VHOST_ACCESS_WO, false);
+ 		if (ret < 0)
+ 			goto out;
+ 		iov_iter_init(&t, WRITE, vq->iotlb_iov, ret, size);
+@@ -840,7 +848,7 @@ static int vhost_copy_from_user(struct vhost_virtqueue *vq, void *to,
+ 
+ 		ret = translate_desc(vq, (u64)(uintptr_t)from, size, vq->iotlb_iov,
+ 				     ARRAY_SIZE(vq->iotlb_iov),
+-				     VHOST_ACCESS_RO);
++				     VHOST_ACCESS_RO, false);
+ 		if (ret < 0) {
+ 			vq_err(vq, "IOTLB translation failure: uaddr "
+ 			       "%p size 0x%llx\n", from,
+@@ -865,7 +873,7 @@ static void __user *__vhost_get_user_slow(struct vhost_virtqueue *vq,
+ 
+ 	ret = translate_desc(vq, (u64)(uintptr_t)addr, size, vq->iotlb_iov,
+ 			     ARRAY_SIZE(vq->iotlb_iov),
+-			     VHOST_ACCESS_RO);
++			     VHOST_ACCESS_RO, false);
+ 	if (ret < 0) {
+ 		vq_err(vq, "IOTLB translation failure: uaddr "
+ 			"%p size 0x%llx\n", addr,
+@@ -1922,7 +1930,7 @@ static int log_used(struct vhost_virtqueue *vq, u64 used_offset, u64 len)
+ 		return log_write(vq->log_base, vq->log_addr + used_offset, len);
+ 
+ 	ret = translate_desc(vq, (uintptr_t)vq->used + used_offset,
+-			     len, iov, 64, VHOST_ACCESS_WO);
++			     len, iov, 64, VHOST_ACCESS_WO, false);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -2043,8 +2051,36 @@ int vhost_vq_init_access(struct vhost_virtqueue *vq)
+ }
+ EXPORT_SYMBOL_GPL(vhost_vq_init_access);
+ 
++static int find_vq_index(const struct vhost_dev *dev, const struct vhost_virtqueue *vq)
++{
++	int i;
++	for (i = 0; i < dev->nvqs; ++i) {
++		if (dev->vqs[i] == vq) {
++			return i;
++		}
++	}
++	return -1;
++}
++
++static int vhost_get_avail_flags_old(void *_vq, __virtio16 *flags, __virtio16 *head)
++{
++	struct vhost_virtqueue *vq;
++	if (!_vq)
++		return 0;
++	if (!flags)
++		return 0;
++	if (!head)
++		return 0;
++	vq = (struct vhost_virtqueue*)_vq;
++	if (vhost_get_avail(vq, *flags, &vq->avail->flags))
++		return 0;
++	if (vhost_get_avail(vq, *head, vhost_used_event(vq)))
++		return 0;
++	return 1;
++}
++
+ static int translate_desc(struct vhost_virtqueue *vq, u64 addr, u32 len,
+-			  struct iovec iov[], int iov_size, int access)
++			  struct iovec iov[], int iov_size, int access, bool track)
+ {
+ 	const struct vhost_umem_node *node;
+ 	struct vhost_dev *dev = vq->dev;
+@@ -2077,6 +2113,13 @@ static int translate_desc(struct vhost_virtqueue *vq, u64 addr, u32 len,
+ 		_iov = iov + ret;
+ 		size = node->size - addr + node->start;
+ 		_iov->iov_len = min((u64)len - s, size);
++
++		if ((access & VHOST_ACCESS_WO) != 0 && track) {
++                        int vq_index = find_vq_index(dev, vq);
++                        severed_get_avail_flags_hook = vhost_get_avail_flags_old;
++                        add_virtio_track_gpa(addr, iov->iov_base, vq_index, vq);
++		}
++
+ 		_iov->iov_base = (void __user *)(unsigned long)
+ 			(node->userspace_addr + addr - node->start);
+ 		s += size;
+@@ -2127,7 +2170,7 @@ static int get_indirect(struct vhost_virtqueue *vq,
+ 	}
+ 
+ 	ret = translate_desc(vq, vhost64_to_cpu(vq, indirect->addr), len, vq->indirect,
+-			     UIO_MAXIOV, VHOST_ACCESS_RO);
++			     UIO_MAXIOV, VHOST_ACCESS_RO, false);
+ 	if (unlikely(ret < 0)) {
+ 		if (ret != -EAGAIN)
+ 			vq_err(vq, "Translation failure %d in indirect.\n", ret);
+@@ -2174,7 +2217,7 @@ static int get_indirect(struct vhost_virtqueue *vq,
+ 
+ 		ret = translate_desc(vq, vhost64_to_cpu(vq, desc.addr),
+ 				     vhost32_to_cpu(vq, desc.len), iov + iov_count,
+-				     iov_size - iov_count, access);
++				     iov_size - iov_count, access, false);
+ 		if (unlikely(ret < 0)) {
+ 			if (ret != -EAGAIN)
+ 				vq_err(vq, "Translation failure %d indirect idx %d\n",
+@@ -2314,7 +2357,7 @@ int vhost_get_vq_desc(struct vhost_virtqueue *vq,
+ 			access = VHOST_ACCESS_RO;
+ 		ret = translate_desc(vq, vhost64_to_cpu(vq, desc.addr),
+ 				     vhost32_to_cpu(vq, desc.len), iov + iov_count,
+-				     iov_size - iov_count, access);
++				     iov_size - iov_count, access, true);
+ 		if (unlikely(ret < 0)) {
+ 			if (ret != -EAGAIN)
+ 				vq_err(vq, "Translation failure %d descriptor idx %d\n",
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index bcb9b2ac0791..b9a91819860a 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -1412,4 +1412,8 @@ int kvm_vm_create_worker_thread(struct kvm *kvm, kvm_vm_thread_fn_t thread_fn,
+ 				uintptr_t data, const char *name,
+ 				struct task_struct **thread_ptr);
+ 
++int __direct_map(struct kvm_vcpu *vcpu, gpa_t gpa, int write,
++		 int map_writable, int max_level, kvm_pfn_t pfn,
++		 bool prefault, bool account_disallowed_nx_lpage);
++
+ #endif
+diff --git a/include/linux/severed.h b/include/linux/severed.h
+new file mode 100644
+index 000000000000..9f1885b02f07
+--- /dev/null
++++ b/include/linux/severed.h
+@@ -0,0 +1,57 @@
++#ifndef __SEVERED_H
++#define __SEVERED_H
++
++#include <linux/types.h>
++#include <linux/ktime.h>
++#include <linux/kvm_host.h>
++#include <linux/severed_export.h>
++
++#define MAX_SEV_BUF_SIZE 2048
++
++//Used to check if a pfn is out of bounds
++//TODO: Determine host memory size at runtime
++#define MAX_HOST_MEMORY 0x7FFFFFFF
++#define SEVERED_MAX_VMS 256
++
++#define SEVERED_NONE 0
++#define SEVERED_STARTTR 1
++#define SEVERED_STOPTR 2
++#define SEVERED_CHGMP 3
++#define SEVERED_FIND_INT_HANDLER 4
++#define SEVERED_INT_HANDLER_SEARCH_RUNNING 5
++#define SEVERED_PRINT 6
++#define SEVERED_FLUSH_TLBS 7
++#define SEVERED_ISSUE_NMI 8
++#define SEVERED_CHGMP_DIR 9
++#define SEVERED_GET_PFN 10
++
++extern unsigned access_identifier;
++extern irq_no_t severed_irq_no;
++extern __u64 last_saved_rip;
++extern __u64 last_gpa;
++extern int severed_action;
++extern bool hit_nmi_entry_point;
++extern u64 last;
++extern u64 packet_counter;
++extern bool packet_has_payload;
++extern void *severed_input_vq;
++extern spinlock_t severed_action_lock;
++extern mapping_change_param_t severed_change_param;
++long kvm_change_mapping(struct kvm_vcpu *vcpu);
++long severed_map_gfn_to_pfn(struct kvm_vcpu *vcpu);
++unsigned kvm_get_access_identifier(void);
++
++void severed_print_access_buf(struct kvm_vcpu *vcpu);
++
++long kvm_start_find_int_handler(struct kvm_vcpu *vcpu);
++
++int init_access_buffer(void);
++
++int severed_log_access(struct kvm_vcpu *vcpu, u32 error_code, gfn_t gfn, enum kvm_page_track_mode mode);
++
++void severed_add_pid(pid_t* severed_vm_pids, pid_t new_pid);
++void severed_remove_pid(pid_t* severed_vm_pids, pid_t pid);
++bool severed_tracked_pid(pid_t* severed_vm_pids, pid_t pid);
++
++#define kvm_severed_log(fmt, ...) printk("[SEVered-%u] " fmt, kvm_get_access_identifier(), ##__VA_ARGS__)
++#endif
+diff --git a/include/linux/severed_export.h b/include/linux/severed_export.h
+new file mode 100644
+index 000000000000..3d285c1b442f
+--- /dev/null
++++ b/include/linux/severed_export.h
+@@ -0,0 +1,70 @@
++#ifndef __SEVERED_EXPORT_H
++#define __SEVERED_EXPORT_H
++
++#include <linux/types.h>
++#include <linux/kvm_host.h>
++#include <linux/vhost.h>
++
++typedef struct virtio_track {
++    __u64 gpa;
++} virtio_track_t;
++
++typedef struct irq_no {
++    int irq_no;
++    pid_t pid;
++} irq_no_t;
++
++typedef struct mapping_change_param {
++    __u64 gfn1;
++    __u64 gfn2;
++    pid_t pid;
++} mapping_change_param_t;
++
++typedef struct mapping_change_param2 {
++    __u64 gfn;
++    __u64 pfn;
++    pid_t pid;
++} mapping_change_param2_t;
++
++typedef struct access {
++    __u64 gfn;
++    __u64 gva;
++    __u64 gpa;
++    u32 error_code;
++    ktime_t time;
++} access_t;
++
++typedef struct translate_gfn {
++    __u64 gfn;
++    pid_t pid;
++} translate_gfn_t;
++
++extern struct kvm *last_created_vm;
++
++extern int severed_virtio_tracking_active;
++extern u64 translate_gfn;
++extern u64 last_error_code;
++extern mapping_change_param2_t severed_gfn_to_pfn_map;
++extern u64 post_expl_nmi_gfn;
++extern u64 post_expl_do_nmi_gfn;
++extern u64 post_expl_do_nmi_pfn;
++extern void *severed_input_vq;
++extern int (*severed_get_avail_flags_hook)(void *_vq, __virtio16 *flags, __virtio16 *head);
++
++extern struct kvm_vcpu *severed_last_vcpu;
++
++long kvm_start_tracking(struct kvm_vcpu *vcpu, u64 *except, enum kvm_page_track_mode mode);
++long kvm_stop_tracking(struct kvm_vcpu *vcpu, enum kvm_page_track_mode mode);
++
++long severed_start_tracking(struct kvm_vcpu *vcpu, u64 gfn, enum kvm_page_track_mode mode, int mmu_lock_acquire);
++long add_virtio_track_gpa(u64 gpa, void __user *iov_base, int vq_index, void *vq);
++long set_virtio_tracking(void);
++long kvm_start_tracking_virtio_pages(struct kvm_vcpu *vcpu, int only_new);
++
++void severed_store_kvm_struct(struct kvm *kvm);
++void severed_remove_kvm_struct(struct kvm *kvm);
++
++long severed_translate_gpa(struct kvm_vcpu *vcpu);
++
++void set_error_code(u64);
++#endif
+diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
+index 4b95f9a31a2f..d867ebcf4f20 100644
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -811,6 +811,17 @@ struct kvm_ppc_resize_hpt {
+ #define KVM_GET_EMULATED_CPUID	  _IOWR(KVMIO, 0x09, struct kvm_cpuid2)
+ #define KVM_GET_MSR_FEATURE_INDEX_LIST    _IOWR(KVMIO, 0x0a, struct kvm_msr_list)
+ 
++#define KVM_TRACKING_ENABLE		_IOWR(KVMIO, 0x0b, unsigned)
++#define KVM_TRACKING_DISABLE		_IO(KVMIO,   0x0c)
++#define KVM_MAPPING_CHANGE		_IOWR(KVMIO, 0x0d, mapping_change_param_t)
++#define KVM_FIND_INT_HANDLER		_IOWR(KVMIO, 0x0e, int)
++#define KVM_SET_ACCESS_ID		_IOWR(KVMIO, 0x0f, int)
++#define KVM_SET_VIRTIO_TRACKING		_IOWR(KVMIO, 0x10, int)
++#define KVM_PRINT_BUF			_IO(KVMIO, 0x11)
++#define KVM_GET_PFN			_IOWR(KVMIO, 0x12, unsigned long long)
++#define KVM_ISSUE_NMI			_IO(KVMIO, 0x14)
++#define KVM_MAPPING_CHANGE_DIRECT      _IOWR(KVMIO, 0x15, mapping_change_param2_t)
++
+ /*
+  * Extension capability list.
+  */
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 70f03ce0e5c1..bbc9c0b30435 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -61,6 +61,8 @@
+ #include "async_pf.h"
+ #include "vfio.h"
+ 
++#include <linux/severed.h>
++
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/kvm.h>
+ 
+@@ -100,6 +102,33 @@ DEFINE_MUTEX(kvm_lock);
+ static DEFINE_RAW_SPINLOCK(kvm_count_lock);
+ LIST_HEAD(vm_list);
+ 
++
++__u64 last_gpa;
++EXPORT_SYMBOL(last_gpa);
++__u64 last_saved_rip;
++EXPORT_SYMBOL(last_saved_rip);
++irq_no_t severed_irq_no = {.irq_no = -1};
++EXPORT_SYMBOL(severed_irq_no);
++int severed_action = SEVERED_NONE;
++EXPORT_SYMBOL(severed_action);
++mapping_change_param_t severed_change_param;
++EXPORT_SYMBOL(severed_change_param);
++mapping_change_param2_t severed_gfn_to_pfn_map;
++EXPORT_SYMBOL(severed_gfn_to_pfn_map);
++bool hit_nmi_entry_point = false;
++EXPORT_SYMBOL(hit_nmi_entry_point);
++
++ktime_t severed_stop_time;
++EXPORT_SYMBOL(severed_stop_time);
++DEFINE_SPINLOCK(severed_action_lock);
++EXPORT_SYMBOL(severed_action_lock);
++
++pid_t severed_pid_from_shell;
++EXPORT_SYMBOL(severed_pid_from_shell);
++pid_t severed_vm_pids[SEVERED_MAX_VMS] = {0};
++//EXPORT_SYMBOL(severed_vm_pids);
++
++
+ static cpumask_var_t cpus_hardware_enabled;
+ static int kvm_usage_count;
+ static atomic_t hardware_enable_failed;
+@@ -853,7 +882,7 @@ static int kvm_vm_release(struct inode *inode, struct file *filp)
+ 	struct kvm *kvm = filp->private_data;
+ 
+ 	kvm_irqfd_release(kvm);
+-
++	severed_remove_pid(severed_vm_pids, kvm->userspace_pid);
+ 	kvm_put_kvm(kvm);
+ 	return 0;
+ }
+@@ -2219,7 +2248,8 @@ static int __kvm_gfn_to_hva_cache_init(struct kvm_memslots *slots,
+ 	gfn_t start_gfn = gpa >> PAGE_SHIFT;
+ 	gfn_t end_gfn = (gpa + len - 1) >> PAGE_SHIFT;
+ 	gfn_t nr_pages_needed = end_gfn - start_gfn + 1;
+-	gfn_t nr_pages_avail;
++	//SEVered: change this so that the compiler does not complain
++	gfn_t uninitialized_var(nr_pages_avail);
+ 
+ 	/* Update ghc->generation before performing any error checks. */
+ 	ghc->generation = slots->generation;
+@@ -3290,6 +3320,7 @@ static int kvm_ioctl_create_device(struct kvm *kvm,
+ 	}
+ 
+ 	cd->fd = ret;
++	last_created_vm = kvm;
+ 	return 0;
+ }
+ 
+@@ -3387,7 +3418,6 @@ static long kvm_vm_ioctl(struct file *filp,
+ 		if (copy_from_user(&kvm_userspace_mem, argp,
+ 						sizeof(kvm_userspace_mem)))
+ 			goto out;
+-
+ 		r = kvm_vm_ioctl_set_memory_region(kvm, &kvm_userspace_mem);
+ 		break;
+ 	}
+@@ -3632,7 +3662,7 @@ static int kvm_dev_ioctl_create_vm(unsigned long type)
+ 		return -ENOMEM;
+ 	}
+ 	kvm_uevent_notify_change(KVM_EVENT_CREATE_VM, kvm);
+-
++	severed_add_pid(severed_vm_pids, kvm->userspace_pid);
+ 	fd_install(r, file);
+ 	return r;
+ 
+@@ -3645,6 +3675,7 @@ static long kvm_dev_ioctl(struct file *filp,
+ 			  unsigned int ioctl, unsigned long arg)
+ {
+ 	long r = -EINVAL;
++	void __user *argp;
+ 
+ 	switch (ioctl) {
+ 	case KVM_GET_API_VERSION:
+@@ -3674,6 +3705,115 @@ static long kvm_dev_ioctl(struct file *filp,
+ 	case KVM_TRACE_DISABLE:
+ 		r = -EOPNOTSUPP;
+ 		break;
++	case KVM_SET_ACCESS_ID:
++		if (copy_from_user(&access_identifier, (void __user *)arg, sizeof(access_identifier)))
++			return -EFAULT;
++		r = 0;
++		break;
++	case KVM_FIND_INT_HANDLER:
++		spin_lock(&severed_action_lock);
++		if (severed_action == SEVERED_NONE) {
++			if (copy_from_user(&severed_irq_no, (void __user *)arg, sizeof(severed_irq_no)))
++				return -EFAULT;
++			severed_pid_from_shell = severed_irq_no.pid;
++			if (severed_tracked_pid(severed_vm_pids,severed_pid_from_shell))
++				severed_action = SEVERED_FIND_INT_HANDLER;
++			r = 0;
++		}
++		spin_unlock(&severed_action_lock);
++		break;
++	case KVM_ISSUE_NMI:
++		spin_lock(&severed_action_lock);
++		if (severed_action == SEVERED_NONE) {
++			if (copy_from_user(&severed_pid_from_shell, (void __user *)arg, sizeof(severed_pid_from_shell)))
++	                        return -EFAULT;
++			if (severed_tracked_pid(severed_vm_pids,severed_pid_from_shell))
++				severed_action = SEVERED_ISSUE_NMI;
++			r = 0;
++		}
++		spin_unlock(&severed_action_lock);
++		break;
++	case KVM_PRINT_BUF:
++		spin_lock(&severed_action_lock);
++		if (severed_action == SEVERED_NONE) {
++			severed_action = SEVERED_PRINT;
++			r = 0;
++		}
++		spin_unlock(&severed_action_lock);
++		break;
++	case KVM_SET_VIRTIO_TRACKING:
++		{
++		if (copy_from_user(&severed_virtio_tracking_active, (void __user *)arg, sizeof(int)))
++			return -EFAULT;
++		r = set_virtio_tracking();
++		break;
++		}
++	case KVM_TRACKING_ENABLE:
++		spin_lock(&severed_action_lock);
++		if (severed_action == SEVERED_NONE) {
++			if (copy_from_user(&severed_pid_from_shell, (void __user *)arg, sizeof(severed_pid_from_shell)))
++				return -EFAULT;
++			if (severed_tracked_pid(severed_vm_pids,severed_pid_from_shell))
++				severed_action = SEVERED_STARTTR;
++			r = 0;
++		}
++		spin_unlock(&severed_action_lock);
++		break;
++	case KVM_TRACKING_DISABLE:
++		severed_stop_time = ktime_get();
++		spin_lock(&severed_action_lock);
++		if (severed_action == SEVERED_NONE) {
++			if (copy_from_user(&severed_pid_from_shell, (void __user *)arg, sizeof(severed_pid_from_shell)))
++	                        return -EFAULT;
++			if (severed_tracked_pid(severed_vm_pids,severed_pid_from_shell))
++				severed_action = SEVERED_STOPTR;
++			r = 0;
++		}
++		spin_unlock(&severed_action_lock);
++		break;
++	case KVM_MAPPING_CHANGE_DIRECT:
++		spin_lock(&severed_action_lock);
++		if (severed_action == SEVERED_NONE) {
++			if (copy_from_user(&severed_gfn_to_pfn_map, (void __user *)arg, sizeof(mapping_change_param2_t))) {
++				printk("SEVered: wrong GFN, returning EFAULT");
++				return -EFAULT;
++			}
++			severed_pid_from_shell = severed_gfn_to_pfn_map.pid;
++			if (severed_tracked_pid(severed_vm_pids,severed_pid_from_shell))
++				severed_action = SEVERED_CHGMP_DIR;
++			r = 0;
++		}
++		spin_unlock(&severed_action_lock);
++		break;
++	case KVM_MAPPING_CHANGE:
++		argp = (void __user *)arg;
++		spin_lock(&severed_action_lock);
++		if (severed_action == SEVERED_NONE) {
++			if (copy_from_user(&severed_change_param, argp, sizeof(mapping_change_param_t)))
++				return -EFAULT;
++			severed_pid_from_shell = severed_change_param.pid;
++			if (severed_tracked_pid(severed_vm_pids,severed_pid_from_shell))
++				severed_action = SEVERED_CHGMP;
++			r = 0;
++		}
++		spin_unlock(&severed_action_lock);
++		break;
++	case KVM_GET_PFN:
++		{
++		translate_gfn_t severed_translate_gfn;
++		spin_lock(&severed_action_lock);
++		if (severed_action == SEVERED_NONE) {
++			if (copy_from_user(&severed_translate_gfn, (void __user *)arg, sizeof(severed_translate_gfn)))
++				return -EFAULT;
++			severed_pid_from_shell = severed_translate_gfn.pid;
++			translate_gfn = severed_translate_gfn.gfn;
++			if (severed_tracked_pid(severed_vm_pids,severed_pid_from_shell))
++				severed_action = SEVERED_GET_PFN;
++			r = 0;
++		}
++		spin_unlock(&severed_action_lock);
++		}
++		break;
+ 	default:
+ 		return kvm_arch_dev_ioctl(filp, ioctl, arg);
+ 	}

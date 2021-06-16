@@ -2,115 +2,62 @@
 
 ## Description
 
-SEVered is framework for Virtual Machine Introspection (VMI) of encrypted Virtual Machines.  
-The framework allows you to track memory accesses of VMs, and the modify the Second Level Adress Translation (SLAT)
+SEVered is framework for Virtual Machine Introspection (VMI) of Virtual Machines protected by technologies such as AMD SEV.  
+The framework allows to track memory accesses of VMs, and to modify the Second Level Adress Translation (SLAT).
 
-This allows you for example to execute the SEVered attack, which is described here: 
+This enables you to execute attacks such as SEVered and SEVerity:  
 
 <https://arxiv.org/abs/1805.09604>
+<https://arxiv.org/abs/2105.13824>
 
 ## Features
 
-The framework adds the following IOCTLs to /dev/kvm: 
-
-* KVM_TRACKING_ENABLE <pid>
-Start to track memory accesses of a VM with the given PID. Each memory access will be tracked once. 
-
-* KVM_TRACKING_DISABLE <pid>
-Stop tracking of memory accesses. List of all tracked memory accesses will be written to dmesg. 
-
-* KVM_MAPPING_CHANGE <pid> <GFN1> <GFN2>
-Remap GFN1 of a VM with the given PID to the PFN of GFN2. 
-
-We use https://github.com/jerome-pouiller/ioctl to call IOCTLs. 
-
-`sudo ioctl /dev/kvm <IOCTL-NAME>`
-
-## Limitations
-
-* We do not support situations in which multiple VMs with multiple vcpus are running, and at least one physical core is shared among VMs. 
-* PIDs must match a running VM. Otherwise, the host OS might freeze. 
+The framework provides the following functions:
+- severed_set_access_id(id=int): Set the access identifier used in prints
+- severed_disable_tracking(pid=int): Disable page tracking
+- severed_enable_tracking(pid=int): Enable page tracking
+- severed_print_buf(): Print the tracked pages in the buffer
+- severed_translate_gfn(gfn=unsigned_long,pid=int): Translate a given GFN to a PFN
+- severed_change_mapping(gfn1=unsigned_long,gfn2=unsigned_long,pid=int): Swap page mapping of two GFNs in SLAT
+- severed_change_mapping_direct(gfn=unsigned_long,pfn=unsigned_long,pid=int): Change mapping of a GFN to a specific PFN in SLAT
+- severed_find_int_handler(interrupt=int,pid=int): Identify interrupt handler in guest
+        - ```interrupt=-1``` for NMI interrupt
+- severed_issue_nmi(pid=int): Send an NMI to the guest
+- severed_set_virtio_track(): Enable/Disable virtio tracking
 
 ## Linux Kernel and Patch
 
-* Download and extract Linux 4.18.13:
+1. Clone AMD's linux kernel from [https://github.com/AMDESE/linux](https://github.com/AMDESE/linux)  
+2. Change into the sev-es-5.6-v3 branch with ```git checkout sev-es-5.6-v3``` and apply the patch: ```patch -p1 < ../severed_framework.patch```
+3. Configure the kernel: ```cp /boot/config-$(uname -r) .config```
+4. Build the kernel with ```make -j <number of threads>``` 
+5. Build the kernel modules with ```make -j <number of threads> modules_install```
+6. Install the newly compiled kernel with ```make install```
+7. Boot the new kernel
 
-* Enter the kernel directory and apply the patch: 
+## Installing Python Module
 
-`patch -p1 < severed_patch_4.18.13.patch`
+We provide a python package for version 3.9. You can install it using pip:
 
-* Build the kernel. We use this command: 
+```
+python3 -m pip severed_bindings-1.0-cp39-cp39-linux_x86_64.whl
+```
 
-`make-kpkg --initrd kernel_image modules_image -j 16`
+For other python versions, you can create your own package using ```severed_bindings-1.0.tar.gz```
 
-* Afterwards, install the kernel and boot it up: 
-
-`sudo dpkg -i ../name_of_image.deb`
-
-## Ioctl Tool Installation
-
-Note: Ioctl installation can be a bit difficult. Alternatively, you may want to write you own programm to send data to /dev/kvm. 
-
-In order to install the ioctl tool the following steps are taken:
-
-* download the ioctl tool here https://github.com/jerome-pouiller/ioctl,
-
-* before compiling and building the tool, install the dependencies: 
-
-`sudo apt-get install libasound2-dev libdrm-dev`
-
-* open the file ioctls_list.c and replace the line
-
-`#include <linux/nvme.h>`
-
-with  the line
-`#include <linux/nvme_ioctl.h>`
-
-* Type `make` and and comment all the lines ioctls_list.c about which the compiler complains,
-
-* add the following lines into the file ioctls_list.c
-
-`{"KVM_TRACKING_ENABLE", KVM_TRACKING_ENABLE, -1, -1}, //linux/kvm.h:782`
-
-`{"KVM_TRACKING_DISABLE", KVM_TRACKING_DISABLE, -1, -1}, //linux/kvm.h:783`
-
-`{"KVM_MAPPING_CHANGE", KVM_MAPPING_CHANGE, -1, -1}, //linux/kvm.h:784`
-
-* hit "make" again,
-
-* copy the file kvm.h from your patched linux directory to the installed 
-linux directory. (important: linux kernel should be built at this step):
-
-`sudo cp your_linux_folder/include/uapi/linux/kvm.h /usr/include/linux/`
-
-* hit "sudo make install".
-
-After installation, the command ioctl will be accessable in any directory.
-See below how to run the tool.
+Once you installed the package, the functions of the SEVered framework can be called by importing the package ```severed_bindings``` in any python file.
 
 ## Using the SEVered framework
 
-* Start up the VM
+1. Start up the VM
+2. Import the ```severed_bindings``` package in a python file
+3. All the functions can be called using the imported package
 
-* To clean kernel outputs use
+Our [Test](./test.py) file shows examples for all functions. 
 
-`sudo dmesg -C`.
+## Limitations
 
-* To start tracking use the command:
-
-`sudo ioctl /dev/kvm KVM_TRACKING_ENABLE 
-
-Afterwards, enter the PID of the VM you want to be tracked.`
-
-* To stop tracking use the command
-
-`sudo ioctl /dev/kvm KVM_TRACKING_DISABLE <PID>`.
-
-Afterwards, enter the PID of the VM.
-
-* To change mapping use the command
-
-`sudo ioctl /dev/kvm KVM_MAPPING_CHANGE`.
-
-Here it is required to give a PID, GFN1 and GFN2 separated by comma, for instance, 3132,2a96,36f1.
-
+- The size of the target VM is statically configued with 2GB. If the target VM has a different amount of memory, this has to be modified accordingly.
+        - There is an attempt to dynamically adjust the VM memory size in arch/x86/kvm/svm.c @ 5464-5468. However, although the correct size is calculated, when used with the framework it will end up in a soft lockup.
+- severed_set_virtio_track(int) does not provide a PID parameter, and therefore will only work effectively when only one VM is running.
+- Only 4 PIDs are tracked, thus only the first 4 VMs will be tracked. If a 5th VM is booted, it can't be address with the framework.
