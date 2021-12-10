@@ -43,7 +43,12 @@ We provide a python package for version 3.9. You can install it using pip:
 python3 -m pip severed_bindings-1.0-cp39-cp39-linux_x86_64.whl
 ```
 
-For other python versions, you can create your own package using ```severed_bindings-1.0.tar.gz```
+For other python versions, you can create your own package using ```severed_bindings-1.0.tar.gz``` and ```distutils```.
+
+1. Extract the contents of the tar with ```tar -xvf severed_bindings-1.0.tar.gz```
+2. Go into the newly extracted folder ```cd severed_bindings-1.0/```
+3. Use the setup.py script to install the severed_bindings in your current python3 version with ```sudo python3 setup.py install```
+4. The severed_bindings should be installed now, import them as any normal library in python with ```import severed_bindings```
 
 Once you installed the package, the functions of the SEVered framework can be called by importing the package ```severed_bindings``` in any python file.
 
